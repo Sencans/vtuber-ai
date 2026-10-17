@@ -224,8 +224,42 @@ input[type="range"] { width: 100%; accent-color: var(--accent); }
 .log .empty { color: var(--muted); background: none; border: 0; padding: 0; }
 
 /* ------------------------------------------------------------ OBS / responsive */
+html.obs { color-scheme: normal; background: transparent; }
 body.obs { grid-template-columns: 1fr; }
 body.obs .panel, body.obs .hud, body.obs .audio-hint { display: none !important; }
+
+/* ------------------------------------------------------------ modo escritorio (?desktop=1)
+   La ventana de Amadeus Desktop es transparente y cubre el área de trabajo; el canvas es una caja
+   de 340×600 que app.js mueve con transform (y que pide ser interactiva solo sobre el cuerpo). */
+html.desktop, body.desktop { background: transparent !important; overflow: hidden; }
+body.desktop { display: block; user-select: none; -webkit-user-select: none; }
+body.desktop .stage {
+  position: fixed; left: 0; top: 0;
+  width: 340px; height: 600px;
+  overflow: visible;
+  background: transparent !important;
+  will-change: transform;
+  contain: layout style;
+}
+body.desktop #scene { cursor: default; }
+body.desktop.sobre-avatar #scene { cursor: grab; }
+body.desktop.arrastrando #scene { cursor: grabbing; }
+body.desktop .drop-hint { display: none; }
+body.desktop .overlay { background: transparent; backdrop-filter: none; }
+body.desktop .overlay-card { font-size: 12.5px; padding: 10px 14px; }
+body.desktop .bubble { font-size: 13.5px; max-width: 300px; }
+/* Indicador visible de cámara abierta (COMPANION §C2.13): solo en el overlay y sin capturar clics. */
+.ojo-camara { display: none; }
+.ojo-camara[hidden] { display: none !important; }
+body.desktop .ojo-camara {
+  display: flex; align-items: center; justify-content: center;
+  position: absolute; top: 8px; right: 8px; z-index: 5;
+  width: 26px; height: 26px; border-radius: 50%;
+  font-size: 15px; line-height: 1;
+  background: rgba(20, 16, 30, 0.72); color: #fff;
+  box-shadow: 0 0 0 2px rgba(255, 70, 70, 0.85);
+  pointer-events: none;
+}
 
 @media (max-width: 760px) {
   body { grid-template-columns: 1fr; grid-template-rows: 55vh 1fr; overflow: auto; }

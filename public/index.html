@@ -6,12 +6,13 @@
   <title>VTuber AI Studio</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='28' r='18' fill='%23a594ff'/><circle cx='25' cy='27' r='3' fill='%23161427'/><circle cx='39' cy='27' r='3' fill='%23161427'/><path d='M24 36q8 6 16 0' stroke='%23161427' stroke-width='3' fill='none' stroke-linecap='round'/></svg>">
   <link rel="stylesheet" href="/style.css">
+  <!-- código de terceros servido en local (three 0.180.0, @pixiv/three-vrm 3.4.4): ver /vendor/VENDOR.md -->
   <script type="importmap">
   {
     "imports": {
-      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
-      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
-      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.4/lib/three-vrm.module.min.js"
+      "three": "/vendor/three/build/three.module.js",
+      "three/addons/": "/vendor/three/examples/jsm/",
+      "@pixiv/three-vrm": "/vendor/three-vrm/lib/three-vrm.module.min.js"
     }
   }
   </script>
@@ -20,6 +21,8 @@
   <main class="stage" id="stage">
     <canvas id="scene" aria-label="Avatar VTuber 3D"></canvas>
     <div class="bubble" id="bubble" hidden></div>
+    <!-- modo escritorio: la cámara de R.A.M.S. está abierta (orden "camara" de Amadeus Desktop) -->
+    <div class="ojo-camara" id="ojo-camara" role="status" aria-label="Cámara de R.A.M.S. activa" title="Cámara de R.A.M.S. activa" hidden>👁</div>
 
     <div class="overlay" id="overlay">
       <div class="overlay-card">
@@ -171,6 +174,12 @@
           </label>
           <select id="model-select" aria-label="Modelos disponibles"></select>
           <p class="hint">También puedes arrastrar un .vrm a la ventana, o copiarlo a la carpeta <code>models/</code>. Crea el tuyo gratis con VRoid Studio.</p>
+        </div>
+
+        <div class="group">
+          <h2>Tema</h2>
+          <div class="chips" id="theme-chips"></div>
+          <p class="hint">Amadeus recolorea el modelo con la paleta de Kurisu (homenaje de fan). Recarga el modelo al cambiar.</p>
         </div>
 
         <div class="group">

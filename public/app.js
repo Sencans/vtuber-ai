@@ -1,5 +1,13 @@
 // VTuber AI Studio — visor y motor de animación.
 // Recibe comandos de la IA por SSE (/api/events) y los ejecuta sobre un modelo VRM.
+//
+// Modos por URL:
+//   ?obs=1      transparente y sin panel (fuente de navegador de OBS).
+//   ?desktop=1  modo escritorio para Amadeus Desktop (Electron): implica ?obs=1, el canvas es una
+//               "caja" de 340×600 que se mueve por la pantalla con transform, hit-test por raycast,
+//               comandos "desktop" y órdenes del proceso principal (window.amadeusDesktop).
+//   ?tts=1      voz del navegador también en ?obs=1 / ?desktop=1 (si no, en ellos se ignora "tts").
+//   ?theme=amadeus  tema visual Amadeus (look de Kurisu) desde /amadeus_theme.js.
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -7,6 +15,7 @@ import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
 import {
   DEFAULT_MODEL_URL, EMOTIONS, EMOTION_LABELS, VISEMES, POSES, GESTURES, HAND_SHAPES,
   LOOK_TARGETS, CAMERA_PRESETS, BACKGROUNDS, COMMANDS, COMMAND_TYPES,
+  DESKTOP_ACTIONS, DESKTOP_EDGES, DESKTOP_LIMITS, DESKTOP_BOX, THEMES, THEME_LIMITS, RESTRICTED_TYPES,
 } from '/protocol.js';
 
 // ===================================================================== utilidades
@@ -32,8 +41,24 @@ class CommandError extends Error {}
 const fail = (msg) => { throw new CommandError(msg); };
 
 const params = new URLSearchParams(location.search);
-const OBS = params.has('obs');
-if (OBS) document.body.classList.add('obs');
+const DESKTOP = params.has('desktop');
+const OBS = params.has('obs') || DESKTOP;          // el modo escritorio implica el de OBS
+// Regla de audio: como mucho un visor reproduce TTS (el panel); ?obs=1 / ?desktop=1 solo con ?tts=1.
+const TTS_PERMITIDO = !OBS || params.has('tts');
+if (OBS) { document.body.classList.add('obs'); document.documentElement.classList.add('obs'); }
+if (DESKTOP) { document.body.classList.add('desktop'); document.documentElement.classList.add('desktop'); }
+
+// API del preload de Amadeus Desktop (solo existe dentro de Electron, §C2.7.2). Todo es opcional.
+const AD = DESKTOP && window.amadeusDesktop && typeof window.amadeusDesktop === 'object' ? window.amadeusDesktop : null;
+function ad(nombre, ...args) {
+  const f = AD?.[nombre];
+  if (typeof f !== 'function') return undefined;
+  try { return f(...args); } catch (err) { console.warn(`amadeusDesktop.${nombre}:`, err); return undefined; }
+}
+const AD_VISIBILIDAD = typeof AD?.onVisibility === 'function';
+const AD_ORDENES = typeof AD?.onOrder === 'function';
+// Visible: dentro de Electron lo dice el proceso principal (arranca oculta); fuera, la pestaña.
+let visible = AD_VISIBILIDAD ? false : document.visibilityState === 'visible';
 
 // ===================================================================== escena
 const canvas = $('#scene');
@@ -47,6 +72,7 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(30, 1, 0.05, 100);
 camera.position.set(0, 1.3, 3.6);
 const controls = new OrbitControls(camera, canvas);
+controls.enabled = !DESKTOP;                     // en el escritorio, arrastrar = mover a la avatar, no la cámara
 controls.target.set(0, 1.0, 0);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
@@ -106,9 +132,14 @@ const boneState = new Map();   // hueso -> { cur, from, to, t0, dur }  (radianes
 const exprState = new Map();   // expresión -> { cur, from, to, t0, dur }
 const gestures = new Map();    // nombre -> { name, impl, t0, dur, fade, mirror, loop, resolve }
 const root = { cur: { x: 0, z: 0, ry: 0 }, from: null, to: null, t0: 0, dur: 0, walk: false, resolve: null, phase: 0 };
+// Caminar "en cinta" del modo escritorio: la caja se desplaza por la pantalla y las piernas usan la
+// misma zancada que move con walk. peso 0..1 se suaviza en cada fotograma.
+const andarLibre = { activo: false, peso: 0, ritmo: 1 };
+let reflejoReposo = 1;          // multiplicador del reposo según el estado de R.A.M.S. (solo escritorio)
 const camTween = { active: false };
 const idle = { enabled: !params.has('noidle'), intensity: 1, blink: true };
-const look = { mode: 'camera', head: 0.35, dir: null, yaw: 0, pitch: 0 };
+const LOOK_INICIAL = DESKTOP ? 'mouse' : 'camera';   // en el escritorio "mira" el cursor global
+const look = { mode: LOOK_INICIAL, head: 0.35, dir: null, yaw: 0, pitch: 0 };
 const lookTarget = new THREE.Object3D();
 scene.add(lookTarget);
 const mouseNdc = new THREE.Vector2(0, 0);
@@ -117,6 +148,13 @@ let exprHoldToken = 0;
 let seqToken = 0;
 let background = 'gradient';
 let cameraPreset = 'full';
+
+// Tema visual (§C2.5.5): se aplica solo dentro de loadModel, antes del primer render del modelo.
+let temaDeseado = params.get('theme') === 'amadeus' ? 'amadeus' : 'none';
+let temaOpciones = { rim: true, scanlines: THEME_LIMITS.scanlinesDefault };
+let temaActivo = null;          // { update(t), dispose() } del tema aplicado, o null
+let temaFallido = false;        // el último intento de aplicar "amadeus" falló (import o aplicación)
+const temaNombre = () => (temaActivo ? 'amadeus' : 'none');
 
 const tmpV = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
@@ -523,6 +561,10 @@ function setCamera(preset, dur = 0.9) {
   let target, dist;
   if (preset === 'face') { target = head.clone().add(new THREE.Vector3(0, 0.02, 0)); dist = 0.36 / fov; }
   else if (preset === 'bust') { target = head.clone().add(new THREE.Vector3(0, -0.2, 0)); dist = (0.75 / fov) * Math.sqrt(portrait); }
+  else if (preset === 'full' && DESKTOP) {
+    // caja del escritorio: el cuerpo entero la llena y los pies quedan sobre la línea del suelo (borde inferior)
+    target = new THREE.Vector3(head.x, h * 0.52, head.z); dist = (h * 1.12) / fov;
+  }
   else if (preset === 'full') { target = new THREE.Vector3(head.x, h * 0.53, head.z); dist = ((h * 1.3) / fov) * portrait; }
   else { target = new THREE.Vector3(head.x, h * 0.5, head.z); dist = ((h * 2.1) / fov) * portrait; }
   const fwd = new THREE.Vector3(0, 0, 1); // la cámara siempre mira el escenario de frente
@@ -571,9 +613,30 @@ function hideBubble(delay = 1200) {
   }, delay);
 }
 
-function pickVoice(lang) {
+// Nombres de voces femeninas habituales (Windows, macOS, Google, Edge) para voice: "female".
+const FEMALE_VOICE_HINTS = ['sabina', 'helena', 'laura', 'dalia', 'elvira', 'salome', 'paloma', 'larissa',
+  'hilda', 'lucia', 'monica', 'paulina', 'marisol', 'zira', 'female', 'mujer', 'femenina'];
+
+/**
+ * Elige la voz del TTS. `pref` (opcional) es un nombre o una lista separada por comas
+ * ("Sabina,Helena" o "female"): gana la primera voz cuyo nombre la contenga, preferentemente
+ * del idioma pedido. Si no hay coincidencia se usa la voz elegida en el panel o la del idioma.
+ */
+function pickVoice(lang, pref) {
   if (!('speechSynthesis' in window)) return null;
   const voices = speechSynthesis.getVoices();
+  if (pref) {
+    const want = (lang || 'es').toLowerCase().slice(0, 2);
+    let hints = String(pref).toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
+    if (hints.includes('female')) hints = [...hints.filter((h) => h !== 'female'), ...FEMALE_VOICE_HINTS];
+    for (const sameLang of [true, false]) {
+      for (const h of hints) {
+        const v = voices.find((v) => (!sameLang || v.lang.toLowerCase().startsWith(want))
+          && (v.name.toLowerCase().includes(h) || v.voiceURI.toLowerCase().includes(h)));
+        if (v) return v;
+      }
+    }
+  }
   if (tts.voiceURI && !lang) {
     const v = voices.find((v) => v.voiceURI === tts.voiceURI);
     if (v) return v;
@@ -610,7 +673,7 @@ function speakChunk(chunk, offset, opts) {
   return new Promise((res) => {
     let started = false;
     const u = new SpeechSynthesisUtterance(chunk);
-    const voice = pickVoice(opts.lang);
+    const voice = pickVoice(opts.lang, opts.voice);
     if (voice) { u.voice = voice; u.lang = voice.lang; } else if (opts.lang) u.lang = opts.lang;
     u.rate = opts.rate;
     u.pitch = opts.pitch;
@@ -648,12 +711,13 @@ function speak(c) {
   if (c.gesture && vrm) startGesture(c.gesture, { side: c.side });
 
   const est = Math.max(1, text.length / speech.cps + 0.3);
-  const useTts = (c.tts ?? tts.enabled) && 'speechSynthesis' in window;
+  // ?obs=1 / ?desktop=1 sin ?tts=1 ignoran c.tts: nunca suenan dos voces a la vez.
+  const useTts = TTS_PERMITIDO && (c.tts ?? tts.enabled) && 'speechSynthesis' in window;
   let done;
   if (useTts) {
     done = (async () => {
       let offset = 0;
-      const opts = { lang: c.lang, rate, pitch, volume: clamp(num(c.volume, 1), 0, 1) };
+      const opts = { lang: c.lang, voice: c.voice, rate, pitch, volume: clamp(num(c.volume, 1), 0, 1) };
       for (const chunk of splitChunks(text)) {
         if (token !== speech.token) return;
         const r = await speakChunk(chunk, offset, opts);
@@ -787,12 +851,16 @@ function composeBones(t, dt) {
     rootY += (f.rootY || 0) * (g.loop ? w : 1);
   }
 
-  // caminar
+  // caminar (por el escenario con move, o por la pantalla en modo escritorio: misma zancada)
   let walkW = 0;
+  let ritmo = 1;
   if (root.to && root.walk) {
     const k = clamp((t - root.t0) / root.dur, 0, 1);
     walkW = smooth(0, 0.12, k) * (1 - smooth(0.88, 1, k));
-    root.phase += dt * TAU * 1.7;
+  }
+  if (andarLibre.peso > walkW) { walkW = andarLibre.peso; ritmo = andarLibre.ritmo; }
+  if (walkW > 0) {
+    root.phase += dt * TAU * 1.7 * ritmo;
     const ph = root.phase, a = 24 * walkW;
     add('leftUpperLeg', -a * S(ph)); add('rightUpperLeg', a * S(ph));
     add('leftLowerLeg', 34 * walkW * Math.max(0, -S(ph - 0.6))); add('rightLowerLeg', 34 * walkW * Math.max(0, S(ph - 0.6)));
@@ -801,9 +869,9 @@ function composeBones(t, dt) {
     rootY += 0.018 * walkW * Math.abs(S(ph));
   }
 
-  // reposo: respiración, balanceo y micro-movimientos
+  // reposo: respiración, balanceo y micro-movimientos (en el escritorio, modulados por el estado de R.A.M.S.)
   if (idle.enabled) {
-    const i = idle.intensity * (1 - walkW * 0.7);
+    const i = idle.intensity * reflejoReposo * (1 - walkW * 0.7);
     const br = S(t * TAU / 4.2);
     add('spine', 0.8 * br * i);
     add('chest', 1.2 * br * i);
@@ -881,18 +949,37 @@ function updateBubble() {
   if (bubble.hidden || !vrm) return;
   headWorld(tmpV).add(new THREE.Vector3(0, 0.22, 0)).project(camera);
   const r = stage.getBoundingClientRect();
-  const x = clamp((tmpV.x * 0.5 + 0.5) * r.width, 120, r.width - 120);
-  const y = clamp((-tmpV.y * 0.5 + 0.5) * r.height, 90, r.height - 20);
+  let x, y;
+  if (DESKTOP) {
+    // en el escritorio el globo puede salir de la caja (no recibe clics): se limita a la ventana
+    const bw = bubble.offsetWidth || 240, bh = bubble.offsetHeight || 60;
+    x = clamp((tmpV.x * 0.5 + 0.5) * r.width, -esc.x + bw / 2 + 8, Math.max(-esc.x + bw / 2 + 8, innerWidth - esc.x - bw / 2 - 8));
+    y = clamp((-tmpV.y * 0.5 + 0.5) * r.height, -esc.y + bh + 8, r.height - 20);
+  } else {
+    x = clamp((tmpV.x * 0.5 + 0.5) * r.width, 120, r.width - 120);
+    y = clamp((-tmpV.y * 0.5 + 0.5) * r.height, 90, r.height - 20);
+  }
   bubble.style.left = `${x}px`;
   bubble.style.top = `${y}px`;
 }
 
 let last = now();
+let ultimoRender = -1;
+let renderActivo = false;
+let gpuListo = Promise.resolve();   // se resuelve cuando terminan de compilar los shaders del modelo
+let temaUpdateRoto = false;
+let framesRender = 0;           // fotogramas dibujados (depuración: window.vtuber.escritorio.frames)
 function frame() {
-  requestAnimationFrame(frame);
   const t = now();
+  if (DESKTOP) {
+    // escritorio: ≤ 30 fps en reposo y ≤ 60 fps caminando o arrastrando
+    const fps = escritorioEnMovimiento() ? 60 : 30;
+    if (ultimoRender >= 0 && t - ultimoRender < 1 / fps - 0.0015) return;
+    ultimoRender = t;
+  }
   const dt = Math.min(0.1, t - last);
   last = t;
+  if (DESKTOP) actualizarEscritorio(t, dt);
   if (vrm) {
     updateRoot(t);
     updateLookTarget();
@@ -900,16 +987,49 @@ function frame() {
     updateExpressions(t, dt);
     vrm.update(dt);
   }
+  if (temaActivo && !temaUpdateRoto) {
+    try { temaActivo.update(t); } catch (err) {
+      temaUpdateRoto = true;
+      console.warn('El tema falló en update(); se deja de animar:', err);
+    }
+  }
   updateCamera(t);
   controls.update();
-  renderer.render(scene, camera);
+  // en el escritorio, con la caja entera fuera de la pantalla no hay nada que dibujar
+  if (!(DESKTOP && cajaFueraDePantalla())) {
+    renderer.render(scene, camera);
+    framesRender++;
+    if (DESKTOP) muestrearHit();   // el búfer de dibujo solo es legible ahora, en esta misma tarea
+  }
   updateBubble();
 }
-requestAnimationFrame(frame);
+function reanudarRender() {
+  if (renderActivo) return;
+  renderActivo = true;
+  last = now();
+  renderer.setAnimationLoop(frame);
+}
+function pausarRender() {
+  if (!renderActivo) return;
+  renderActivo = false;
+  renderer.setAnimationLoop(null);
+}
 
 // ===================================================================== carga de modelos
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
+if (DESKTOP) {
+  // La CSP del overlay de Amadeus Desktop no permite fetch() de URLs blob: (connect-src), que es como
+  // ImageBitmapLoader decodifica las texturas incrustadas en el .vrm. Con TextureLoader (<img>, bajo
+  // img-src blob:) se decodifican igual; es el mismo camino que GLTFLoader usa en Safari/Firefox.
+  loader.register((parser) => {
+    const tl = new THREE.TextureLoader(parser.options.manager);
+    tl.setCrossOrigin(parser.options.crossOrigin);
+    if (parser.options.requestHeader) tl.setRequestHeader(parser.options.requestHeader);
+    parser.textureLoader = tl;
+    return { name: 'vtuber_texturas_img' };
+  });
+}
 const overlay = $('#overlay');
 const overlayText = $('#overlay-text');
 function setOverlay(text, { error = false, show = true } = {}) {
@@ -919,9 +1039,75 @@ function setOverlay(text, { error = false, show = true } = {}) {
 }
 
 let loadToken = 0;
+let cargaEnCurso = 0;           // token de la carga en curso (0 = ninguna)
+let modelUrl = '';              // URL y etiqueta del modelo actual (el comando theme lo recarga)
+let modelLabel = '';
+
+function envolverTema(h) {
+  if (!h || typeof h !== 'object') return null;
+  return {
+    update: (t) => { if (typeof h.update === 'function') h.update(t); },
+    dispose: () => { if (typeof h.dispose === 'function') h.dispose(); },
+  };
+}
+function desecharTema() {
+  const h = temaActivo;
+  temaActivo = null;
+  temaUpdateRoto = false;
+  if (h) { try { h.dispose(); } catch (err) { console.warn('El tema falló en dispose():', err); } }
+}
+function registrarFalloTema(err) {
+  temaFallido = true;
+  const msg = `No se pudo aplicar el tema Amadeus: ${err?.message || err}`;
+  console.warn(msg, err);
+  logEntry('sistema', { type: 'theme', name: 'amadeus' }, { ok: false, error: msg });
+}
+
+/**
+ * Con la ventana de escritorio oculta no se dibuja nada: compilar los shaders (MToon y tema) y subir
+ * las texturas ahora evita un tirón de segundos en el primer fotograma, justo cuando ella aparece.
+ */
+function precargarGpu() {
+  if (typeof renderer.compileAsync === 'function') {
+    gpuListo = renderer.compileAsync(scene, camera)
+      .then(() => {}, (err) => console.warn('No se pudieron precompilar los shaders:', err));
+  }
+  const subidas = new Set();
+  const subir = (tex) => {
+    if (!tex?.isTexture || subidas.has(tex)) return;
+    subidas.add(tex);
+    try { renderer.initTexture(tex); } catch { /* se subirá en el primer render */ }
+  };
+  scene.traverse((o) => {
+    for (const m of [].concat(o.material || [])) {
+      for (const v of Object.values(m)) subir(v);
+      for (const u of Object.values(m.uniforms || {})) subir(u?.value);
+    }
+  });
+}
+
 async function loadModel(url, label) {
   const token = ++loadToken;
+  cargaEnCurso = token;
+  modelUrl = url;
+  modelLabel = label;
+  let info;
+  try {
+    info = await cargarModelo(url, label, token);
+  } finally {
+    if (cargaEnCurso === token) cargaEnCurso = 0;
+  }
+  // El tema pedido cambió mientras se cargaba: una recarga más para aplicarlo (sin bucle si falla).
+  if (info && token === loadToken && temaDeseado !== temaNombre() && !(temaDeseado === 'amadeus' && temaFallido)) {
+    return loadModel(url, label);
+  }
+  return info;
+}
+
+async function cargarModelo(url, label, token) {
   setOverlay('Cargando modelo…');
+  // precarga del módulo del tema en paralelo con la descarga del modelo
+  if (temaDeseado === 'amadeus') import('/amadeus_theme.js').catch(() => {});
   let gltf;
   try {
     gltf = await loader.loadAsync(url, (e) => {
@@ -945,9 +1131,31 @@ async function loadModel(url, label) {
   VRMUtils.rotateVRM0(next);
   next.scene.traverse((o) => { o.frustumCulled = false; });
 
+  desecharTema();
   if (vrm) { avatarRoot.remove(vrm.scene); VRMUtils.deepDispose(vrm.scene); }
   vrm = next;
-  avatarRoot.add(vrm.scene);
+  next.scene.visible = false;     // no se dibuja hasta aplicar (o descartar) el tema
+  avatarRoot.add(next.scene);
+
+  // Tema: tras añadir el modelo a la escena y antes de su primer render.
+  temaFallido = false;
+  if (temaDeseado === 'amadeus') {
+    try {
+      const mod = await import('/amadeus_theme.js');             // import dinámico (archivo del grupo kurisu)
+      if (vrm === next) {
+        if (typeof mod.aplicarTemaAmadeus !== 'function') throw new Error('amadeus_theme.js no exporta aplicarTemaAmadeus');
+        temaActivo = envolverTema(mod.aplicarTemaAmadeus(next, {
+          THREE, rim: temaOpciones.rim, scanlines: temaOpciones.scanlines,
+          escena: scene, avatarRoot, modoEscritorio: DESKTOP,
+        }));
+      }
+    } catch (err) {
+      temaActivo = null;
+      registrarFalloTema(err);
+    }
+  }
+  next.scene.visible = true;
+  if (vrm !== next) return null;  // otra carga lo reemplazó mientras se importaba el tema
 
   modelName = vrm.meta?.name || vrm.meta?.title || label || 'Modelo VRM';
   modelSource = label || url;
@@ -962,6 +1170,7 @@ async function loadModel(url, label) {
   populateBoneSelect();
   setOverlay('', { show: false });
   setCamera(cameraPreset, 0.01);
+  if (!renderActivo) precargarGpu();
   postState();
   logEntry('sistema', { type: 'load_model', name: modelName }, { ok: true });
   return { model: modelName, vrmVersion: vrm.meta?.metaVersion, bones: availableBones.length, expressions: availableExpressions };
@@ -987,6 +1196,7 @@ function snapshot() {
     gestures: Object.keys(GESTURES),
     handShapes: HAND_SHAPES,
     commandTypes: COMMAND_TYPES,
+    mode: DESKTOP ? 'desktop' : OBS ? 'obs' : 'panel',
     current: {
       pose: currentPose,
       expressions: exprs,
@@ -998,16 +1208,29 @@ function snapshot() {
       camera: cameraPreset,
       background,
       idle: idle.enabled,
+      theme: temaNombre(),
     },
   };
 }
 
+let viewerId = null;            // id que asigna el servidor en el evento SSE "hello"
 let stateTimer = 0;
 function postState() {
   clearTimeout(stateTimer);
   stateTimer = setTimeout(() => {
-    fetch('/api/state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(snapshot()) }).catch(() => {});
+    const body = {
+      ...snapshot(),
+      viewerId,
+      viewer: { desktop: DESKTOP, visible, theme: temaActivo ? 'amadeus' : 'none' },
+    };
+    fetch('/api/state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => {});
   }, 250);
+}
+
+/** Nota para el log de actividad (y la consola: en ?obs=1 / ?desktop=1 no hay panel). */
+function anotar(texto, cmd = {}) {
+  console.info(`[visor] ${texto}`);
+  logEntry('sistema', { ...cmd, nota: texto }, { ok: true });
 }
 
 const HANDLERS = {
@@ -1040,14 +1263,48 @@ const HANDLERS = {
   },
   speak: (c) => speak(c),
   look: (c) => { setLook(c); syncChips('#look-chips', look.mode); return {}; },
-  move: (c) => { const { dur, done } = moveAvatar(c); return { result: { seconds: +dur.toFixed(2) }, done }; },
+  move: (c) => {
+    let cmd = c;
+    let ignored;
+    if (DESKTOP && (c.x != null || c.z != null)) {
+      // en el escritorio el avatar no se desplaza por el escenario: la locomoción es el comando "desktop"
+      cmd = { ...c };
+      delete cmd.x;
+      delete cmd.z;
+      ignored = ['x', 'z'];
+      anotar('move: x/z ignorados en modo escritorio (se respetan rotation y walk).', { type: 'move' });
+    }
+    if (locomocionDeElectron() && cmd.rotation != null) {
+      // entrando o saliendo por el borde mira hacia donde camina: el giro es de esa locomoción
+      cmd = { ...cmd };
+      delete cmd.rotation;
+      ignored = [...(ignored || []), 'rotation'];
+      anotar('move: rotation ignorado mientras entra o sale por el borde.', { type: 'move' });
+    }
+    const { dur, done } = moveAvatar(cmd);
+    return { result: { seconds: +dur.toFixed(2), ...(ignored ? { ignored } : {}) }, done };
+  },
   camera: (c) => {
+    if (DESKTOP) {
+      // la caja de 340×600 está encuadrada para el cuerpo entero: no se cambia el encuadre
+      if (!CAMERA_PRESETS.includes(c.preset || 'bust')) fail(`Encuadre desconocido "${c.preset}". Opciones: ${CAMERA_PRESETS.join(', ')}`);
+      anotar('camera: ignorado en modo escritorio.', { type: 'camera', preset: c.preset });
+      return { result: { ignored: true, camera: cameraPreset } };
+    }
     const dur = clamp(num(c.duration, 0.9), 0, 10);
     setCamera(c.preset || 'bust', dur);
     syncChips('#camera-chips', c.preset || 'bust');
     return { done: wait(dur * 1000) };
   },
-  background: (c) => { setBackground(c.mode || c.color || 'gradient'); return {}; },
+  background: (c) => {
+    const mode = c.mode || c.color || 'gradient';
+    if (DESKTOP && mode !== 'transparent') {
+      anotar('background: el modo escritorio siempre es transparente.', { type: 'background', mode });
+      return { result: { ignored: true, background } };
+    }
+    setBackground(mode);
+    return {};
+  },
   idle: (c) => {
     if (c.enabled != null) idle.enabled = !!c.enabled;
     if (c.intensity != null) idle.intensity = clamp(num(c.intensity, 1), 0, 2);
@@ -1062,17 +1319,30 @@ const HANDLERS = {
     if (what === 'all' || what === 'sequence') seqToken++;
     if (what === 'all' || what === 'gestures') stopGestures();
     if (what === 'all' || what === 'speech') stopSpeech();
-    if (what === 'all' || what === 'move') { if (root.to) { root.to = null; root.resolve?.(); root.resolve = null; } }
+    if (what === 'all' || what === 'move') {
+      if (DESKTOP) esc.diferida++;             // descarta la acción "desktop" que esperaba a la entrada
+      // en el escritorio también para la locomoción por la pantalla, salvo la del proceso principal
+      // (entrada y salida por el borde: cortarla la dejaría varada fuera de la pantalla)
+      if (!locomocionDeElectron()) {
+        if (root.to) { root.to = null; root.resolve?.(); root.resolve = null; }
+        if (DESKTOP) cancelarLocomocion(false);
+      }
+    }
     return {};
   },
   reset: () => {
     seqToken++;
     stopGestures(); stopSpeech();
     if (vrm) { applyPose('relaxed', 0.6); clearEmotions(0.4); }
-    setLook({ at: 'camera', head: 0.35 });
-    const m = moveAvatar({ x: 0, z: 0, rotation: 0, walk: false, duration: 0.6 });
+    setLook({ at: LOOK_INICIAL, head: 0.35 });
+    if (DESKTOP) esc.diferida++;
+    const deElectron = locomocionDeElectron();
+    if (DESKTOP && !deElectron) cancelarLocomocion(false);
+    const m = deElectron
+      ? { done: Promise.resolve() }
+      : moveAvatar({ x: 0, z: 0, rotation: 0, walk: false, duration: 0.6 });
     idle.enabled = true; idle.intensity = 1; idle.blink = true;
-    syncChips('#emotion-chips', 'neutral'); syncChips('#pose-chips', 'relaxed'); syncChips('#look-chips', 'camera');
+    syncChips('#emotion-chips', 'neutral'); syncChips('#pose-chips', 'relaxed'); syncChips('#look-chips', LOOK_INICIAL);
     return { done: m.done };
   },
   sequence: (c) => {
@@ -1080,6 +1350,7 @@ const HANDLERS = {
     if (!Array.isArray(steps) || !steps.length) fail('sequence requiere "steps": [comandos].');
     steps.forEach((s, i) => {
       if (!s || !COMMAND_TYPES.includes(s.type)) fail(`Paso ${i + 1}: tipo inválido "${s?.type}". Válidos: ${COMMAND_TYPES.join(', ')}`);
+      if (RESTRICTED_TYPES.includes(s.type)) fail(`Paso ${i + 1}: "${s.type}" no puede ir dentro de un sequence.`);
     });
     const token = ++seqToken;
     const done = (async () => {
@@ -1104,6 +1375,26 @@ const HANDLERS = {
     return { result: info || {} };
   },
   state: () => ({ result: snapshot() }),
+  desktop: (c) => comandoEscritorio(c),
+  theme: (c) => {
+    const name = c.name;
+    if (!THEMES.includes(name)) fail(`Tema desconocido "${name}". Opciones: ${THEMES.join(', ')}`);
+    if (c.rim != null && typeof c.rim !== 'boolean') fail('theme: rim debe ser booleano.');
+    temaDeseado = name;
+    temaOpciones = {
+      rim: c.rim ?? true,
+      scanlines: clamp(num(c.scanlines, THEME_LIMITS.scanlinesDefault), THEME_LIMITS.scanlinesMin, THEME_LIMITS.scanlinesMax),
+    };
+    syncChips('#theme-chips', name);
+    if (name === temaNombre()) return { result: { theme: name, changed: false } };    // idempotente
+    // se aplica al terminar la carga en curso (loadModel reconcilia el tema al acabar)
+    if (cargaEnCurso || !modelUrl) return { result: { theme: name, changed: true, pending: true } };
+    // distinto del activo (también "none"): recargar el modelo actual; el ack no espera a la descarga
+    const done = loadModel(modelUrl, modelLabel).then(() => {}, (err) => {
+      console.warn('No se pudo recargar el modelo para cambiar el tema:', err);
+    });
+    return { result: { theme: name, changed: true, reloading: true }, done };
+  },
 };
 
 async function execute(cmd, source = 'manual', { quiet = false } = {}) {
@@ -1127,15 +1418,744 @@ async function runLocal(cmds, source = 'manual') {
   }
 }
 
+// ===================================================================== modo escritorio (Amadeus Desktop)
+// La ventana de Electron cubre el área de trabajo y es transparente; el canvas es una caja de
+// DESKTOP_BOX px CSS que se mueve con transform. El proceso principal de Electron es el único dueño
+// de la visibilidad (onVisibility / onOrder aparecer|esconderse); R.A.M.S. decide la locomoción
+// (comando "desktop"). Aquí solo hay reflejos: mirar el cursor, hit-test, física al soltarla y la
+// curva de caminar del visor. Nada de esto decide cuándo salir ni qué hacer.
+const BOX = { w: DESKTOP_BOX.w, h: DESKTOP_BOX.h };
+const PX_POR_SEG = 280;          // velocidad de paseo base (px CSS/s)
+const GIRO_CAMINAR = 70;         // grados: + = gira a SU izquierda = hacia la derecha de la pantalla
+const GRAVEDAD_PX = 3000;        // px/s² al soltarla en el aire
+const CURSOR_ENCIMA_CADA_S = 10; // cursor_encima como mucho una vez cada 10 s
+const HIT_CADA_MS = 50;          // lectura del hit-test por píxel: ≤ 20 Hz con el cursor moviéndose…
+const HIT_QUIETO_MS = 150;       // …y ≤ ~7 Hz con el cursor quieto (ella se mueve bajo él)
+const HIT_RESPALDO_MS = 250;     // respaldo por raycast (sin lectura de píxeles): ≤ 4 Hz pase lo que pase
+const HIT_ALFA_MIN = 24;         // alfa (0..255) a partir del cual un píxel del canvas es "cuerpo"
+const REPORTE_CADA_MS = 34;      // reportAvatar ≤ 30 Hz
+const esc = {
+  x: 0, y: 0, suelo: 0,
+  oculta: true, saliendo: false, asomada: false,
+  entrada: null,                 // promesa de la entrada por el borde en curso (orden "aparecer" de Electron)
+  diferida: 0,                   // turno de la acción "desktop" que espera a que termine la entrada
+  cursor: null, dentro: false, interactivo: false,
+  drag: null, caida: null, tween: null, seguir: null,
+  token: 0,                      // cada orden/acción nueva invalida la locomoción anterior
+  ultimoEncima: -Infinity,
+  hit: { t: -1, lx: NaN, ly: NaN, r: false },   // última muestra del hit-test (px CSS relativos a la caja)
+  estado: { aburrimiento: 0, fatiga: 0, valencia: 0 },
+  reporte: { t: -1, clave: '', timer: 0 },
+  respaldo: 0,
+};
+
+const sueloY = () => Math.max(0, innerHeight - BOX.h - esc.suelo);
+const limiteX = (x) => clamp(x, -BOX.w * 0.7, Math.max(-BOX.w * 0.7, innerWidth - BOX.w * 0.3));
+const xFueraDe = (borde) => (borde === 'left' ? -BOX.w - 20 : innerWidth + 20);
+const xDentroDe = (borde) => (borde === 'left' ? 60 : Math.max(0, innerWidth - BOX.w - 60));
+const xAsomada = (borde) => (borde === 'left' ? -BOX.w * 0.62 : innerWidth - BOX.w * 0.38);
+const bordeCercano = () => (esc.x + BOX.w / 2 > innerWidth / 2 ? 'right' : 'left');
+const velocidadPx = (vel) => PX_POR_SEG * clamp(vel, DESKTOP_LIMITS.speedMin, DESKTOP_LIMITS.speedMax)
+  * (1 - 0.35 * esc.estado.fatiga);
+
+const cajaFueraDePantalla = () => esc.x >= innerWidth || esc.x + BOX.w <= 0 || esc.y >= innerHeight || esc.y + BOX.h <= 0;
+
+function escritorioEnMovimiento() {
+  return !!(esc.tween || esc.seguir || esc.drag || esc.caida || andarLibre.peso > 0.01 || (root.to && root.walk));
+}
+
+function colocar() {
+  stage.style.transform = `translate3d(${Math.round(esc.x)}px, ${Math.round(esc.y)}px, 0)`;
+  reportarCaja();
+}
+
+/** reportAvatar(rect) a ≤ 30 Hz con el último valor garantizado; rect recortado a la ventana. */
+function reportarCaja(forzar = false) {
+  if (!AD) return;
+  const x0 = Math.max(0, Math.round(esc.x)), y0 = Math.max(0, Math.round(esc.y));
+  const x1 = Math.min(innerWidth, Math.round(esc.x + BOX.w)), y1 = Math.min(innerHeight, Math.round(esc.y + BOX.h));
+  if (x1 - x0 < 1 || y1 - y0 < 1) return;               // fuera de la pantalla: nada que informar
+  const r = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  const clave = `${r.x},${r.y},${r.w},${r.h}`;
+  if (!forzar && clave === esc.reporte.clave) return;
+  const t = performance.now();
+  const espera = REPORTE_CADA_MS - (t - esc.reporte.t);
+  if (!forzar && espera > 0) {
+    if (!esc.reporte.timer) {
+      esc.reporte.timer = setTimeout(() => { esc.reporte.timer = 0; reportarCaja(); }, espera + 1);
+    }
+    return;
+  }
+  esc.reporte.t = t;
+  esc.reporte.clave = clave;
+  ad('reportAvatar', r);
+}
+
+function visibleEnArbol(o) {
+  for (let n = o; n; n = n.parent) if (n.visible === false) return false;
+  return true;
+}
+
+// hit-test: ¿el punto (px CSS de la ventana) cae sobre el cuerpo? Se lee el alfa del propio canvas
+// tras dibujarlo: lo que se ve es lo que se agarra (pelo, corbata del tema, contorno). El raycast contra
+// las mallas con skinning costaba 27–87 ms de CPU por consulta (13 SkinnedMesh, ~25 000 vértices) y
+// saturaba el hilo principal con el cursor encima de ella. La lectura de cada fotograma es asíncrona
+// (WebGL2: readPixels a un PIXEL_PACK_BUFFER + fenceSync, recogida en un fotograma posterior): nunca
+// espera a la GPU. Solo un clic sin muestra reciente bajo el puntero dibuja y lee en el acto.
+const hitRay = new THREE.Raycaster();
+const hitNdc = new THREE.Vector2();
+const hitPx = new Uint8Array(4 * 9);
+const hitTam = new THREE.Vector2();
+const hitGpu = { pbo: null, sync: null, lx: NaN, ly: NaN, t: 0, async: true };
+let hitPorPixel = true;          // false si el contexto no deja leer píxeles → respaldo por raycast
+canvas.addEventListener('webglcontextlost', () => { hitGpu.pbo = null; hitGpu.sync = null; });
+
+/** Punto relativo a la caja si cae en la zona donde puede estar el cuerpo; si no, null. */
+function zonaDelCuerpo(p) {
+  if (!vrm || !p || esc.oculta) return null;
+  const lx = p.x - esc.x, ly = p.y - esc.y;
+  if (lx < 0 || ly < 0 || lx > BOX.w || ly > BOX.h) return null;
+  if (lx < BOX.w * 0.08 || lx > BOX.w * 0.92) return null;    // descarte barato: el cuerpo va centrado
+  return { lx, ly };
+}
+
+/** Esquina inferior izquierda (px del búfer de dibujo; GL tiene el origen abajo) del bloque 3×3 bajo (lx, ly). */
+function pixelBajo(lx, ly) {
+  const gl = renderer.getContext();
+  if (!gl || gl.isContextLost()) return null;
+  const W = gl.drawingBufferWidth, H = gl.drawingBufferHeight;
+  renderer.getSize(hitTam);                            // tamaño CSS del canvas (= la caja)
+  if (W < 3 || H < 3 || !hitTam.x || !hitTam.y) return null;
+  return {
+    gl,
+    px: clamp(Math.floor((lx / hitTam.x) * W) - 1, 0, W - 3),
+    py: clamp(Math.floor(((hitTam.y - ly) / hitTam.y) * H) - 1, 0, H - 3),
+  };
+}
+
+const hayAlfa = () => {
+  for (let i = 3; i < hitPx.length; i += 4) if (hitPx[i] >= HIT_ALFA_MIN) return true;
+  return false;
+};
+
+/**
+ * Lectura SÍNCRONA del entorno 3×3 bajo (lx, ly): espera a la GPU, así que solo se usa para un clic
+ * (o si no hay lectura asíncrona). Válida justo después de renderer.render() en la misma tarea (el
+ * búfer no se conserva entre fotogramas). null si no se puede leer.
+ */
+function alfaEnCaja(lx, ly) {
+  const c = pixelBajo(lx, ly);
+  if (!c) return null;
+  hitPx.fill(0);
+  try { c.gl.readPixels(c.px, c.py, 3, 3, c.gl.RGBA, c.gl.UNSIGNED_BYTE, hitPx); } catch { return null; }
+  return hayAlfa();
+}
+
+/** Encola la lectura asíncrona del 3×3 bajo (lx, ly) del fotograma recién dibujado. false si no se puede. */
+function pedirAlfa(lx, ly) {
+  const c = pixelBajo(lx, ly);
+  if (!c || typeof c.gl.fenceSync !== 'function') return false;
+  const { gl } = c;
+  try {
+    if (!hitGpu.pbo) {
+      hitGpu.pbo = gl.createBuffer();
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, hitGpu.pbo);
+      gl.bufferData(gl.PIXEL_PACK_BUFFER, hitPx.byteLength, gl.STREAM_READ);
+    } else {
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, hitGpu.pbo);
+    }
+    gl.readPixels(c.px, c.py, 3, 3, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!sync) return false;
+    gl.flush();
+    Object.assign(hitGpu, { sync, lx, ly, t: performance.now() });
+    return true;
+  } catch {
+    try { gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); } catch {}
+    return false;
+  }
+}
+
+/** Lectura en vuelo: true/false si la GPU ya la terminó, null si aún no, undefined si no hay o falló. */
+function recogerAlfa() {
+  const sync = hitGpu.sync;
+  if (!sync) return undefined;
+  const gl = renderer.getContext();
+  if (gl.isContextLost()) { hitGpu.sync = null; return undefined; }
+  const st = gl.clientWaitSync(sync, 0, 0);            // sin espera: el estado cambia entre tareas
+  if (st === gl.TIMEOUT_EXPIRED) return null;
+  gl.deleteSync(sync);
+  hitGpu.sync = null;
+  if (st === gl.WAIT_FAILED) return undefined;
+  hitPx.fill(0);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, hitGpu.pbo);
+  gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, hitPx);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  return hayAlfa();
+}
+
+function hitPorRaycast(lx, ly) {
+  hitNdc.set((lx / BOX.w) * 2 - 1, -(ly / BOX.h) * 2 + 1);
+  hitRay.setFromCamera(hitNdc, camera);
+  try { return hitRay.intersectObject(vrm.scene, true).some((i) => visibleEnArbol(i.object)); } catch { return false; }
+}
+
+/** Guarda una muestra y, si cambia lo que hay bajo el cursor, reevalúa si la ventana pide los clics. */
+function anotarMuestra(lx, ly, r) {
+  Object.assign(esc.hit, { t: performance.now(), lx, ly, r });
+  if (r !== esc.dentro && !esc.drag) evaluarInteractivo();
+}
+
+/**
+ * Tras cada fotograma dibujado: recoge la lectura en vuelo (de un fotograma anterior) y pide otra del
+ * píxel bajo el cursor (≤ 20 Hz moviéndose, ≤ ~7 Hz quieto, una sola en vuelo). Sin WebGL2 /
+ * fenceSync, lectura síncrona al mismo ritmo.
+ */
+function muestrearHit() {
+  if (!hitPorPixel) return;
+  if (hitGpu.sync) {
+    let r;
+    try { r = recogerAlfa(); } catch { r = undefined; hitGpu.sync = null; }
+    if (r === null) {
+      if (performance.now() - hitGpu.t < 1000) return;   // la GPU aún no terminó: se recoge luego
+      try { renderer.getContext().deleteSync(hitGpu.sync); } catch {}
+      hitGpu.sync = null;                                  // una lectura atascada no bloquea las siguientes
+    } else if (r !== undefined) {
+      anotarMuestra(hitGpu.lx, hitGpu.ly, r);
+    }
+  }
+  if (esc.drag) return;
+  const h = esc.hit;
+  const l = zonaDelCuerpo(esc.cursor);
+  if (!l) { h.t = -1; h.r = false; return; }          // al volver a entrar en la caja, muestra nueva
+  const t = performance.now();
+  const quieto = Math.abs(l.lx - h.lx) < 1 && Math.abs(l.ly - h.ly) < 1;
+  if (h.t >= 0 && t - h.t < (quieto ? HIT_QUIETO_MS : HIT_CADA_MS)) return;
+  if (hitGpu.async) {
+    if (pedirAlfa(l.lx, l.ly)) return;
+    hitGpu.async = false;                                  // sin lectura asíncrona: síncrona desde ahora
+  }
+  const r = alfaEnCaja(l.lx, l.ly);
+  if (r === null) { hitPorPixel = false; return; }
+  anotarMuestra(l.lx, l.ly, r);
+}
+
+/**
+ * ¿El punto cae sobre el cuerpo? Sin `forzar` (cursor que se mueve, hasta 30 Hz) devuelve la última
+ * muestra de muestrearHit() (llega uno o dos fotogramas tarde), sin coste. Con `forzar` (pulsar, clic
+ * derecho): la muestra si es de ese mismo punto y reciente (lo normal: la ventana solo recibe clics
+ * con el cursor encima); si no, dibuja ahora y lee el píxel exacto.
+ */
+function sobreElCuerpo(p, forzar = false) {
+  const l = zonaDelCuerpo(p);
+  if (!l) return false;
+  const h = esc.hit;
+  if (hitPorPixel) {
+    if (!forzar) return h.t >= 0 && h.r;
+    if (h.t >= 0 && performance.now() - h.t < 250 && Math.abs(l.lx - h.lx) <= 2 && Math.abs(l.ly - h.ly) <= 2) return h.r;
+    let r = null;
+    try { renderer.render(scene, camera); r = alfaEnCaja(l.lx, l.ly); } catch { r = null; }
+    if (r !== null) { Object.assign(h, { t: performance.now(), lx: l.lx, ly: l.ly, r }); return r; }
+    hitPorPixel = false;
+  }
+  // respaldo sin lectura de píxeles: raycast limitado a ≤ 4 Hz aunque el cursor se mueva
+  const t = performance.now();
+  if (!forzar && h.t >= 0 && t - h.t < HIT_RESPALDO_MS) return h.r;
+  const r = hitPorRaycast(l.lx, l.ly);
+  Object.assign(h, { t, lx: l.lx, ly: l.ly, r });
+  return r;
+}
+
+/** El renderer solo PIDE ser interactivo; decide el proceso principal (autoridad del overlay). */
+function pedirInteractivo(v) {
+  if (v === esc.interactivo) return;
+  esc.interactivo = v;
+  document.body.classList.toggle('sobre-avatar', v);
+  ad('setInteractive', v);
+}
+
+function evaluarInteractivo() {
+  const dentro = !!esc.drag || sobreElCuerpo(esc.cursor);
+  if (dentro !== esc.dentro) {
+    esc.dentro = dentro;
+    if (dentro && !esc.drag) {
+      const t = now();
+      if (t - esc.ultimoEncima >= CURSOR_ENCIMA_CADA_S) { esc.ultimoEncima = t; ad('event', 'cursor_encima', {}); }
+    }
+  }
+  pedirInteractivo(dentro);
+}
+
+/** Cursor global (onCursor de Electron o pointermove local), en px CSS de la ventana. */
+function actualizarCursor(p) {
+  if (!p || !Number.isFinite(+p.x) || !Number.isFinite(+p.y)) return;
+  esc.cursor = { x: +p.x, y: +p.y };
+  // "mirarlo": NDC relativas a la caja (fuera de ±1 si el cursor está lejos; la cabeza ya se limita)
+  mouseNdc.set(((esc.cursor.x - esc.x) / BOX.w) * 2 - 1, -((esc.cursor.y - esc.y) / BOX.h) * 2 + 1);
+  if (!esc.oculta) evaluarInteractivo();
+}
+
+function girarHacia(grados, dur) {
+  moveAvatar({ rotation: grados, walk: false, duration: dur });
+}
+
+function enderezar() {
+  if (!esc.asomada) return;
+  esc.asomada = false;
+  if (vrm?.humanoid.getNormalizedBoneNode('spine')) setBone('spine', { z: 0 }, 0.4);
+}
+
+function cancelarLocomocion(deFrente = true) {
+  esc.token++;
+  const tw = esc.tween; esc.tween = null;
+  if (tw) tw.resolve(false);
+  const sg = esc.seguir; esc.seguir = null;
+  if (sg) sg.resolve(false);
+  andarLibre.activo = false;
+  if (deFrente) girarHacia(0, 0.35);
+}
+
+/** Camina hasta x (borde izquierdo de la caja, px CSS) con la curva de caminar del visor. */
+async function caminarA(x1, { vel = 1, libre = false } = {}) {
+  const token = esc.token;
+  if (!libre) x1 = limiteX(x1);
+  if (Math.abs(x1 - esc.x) < 4) return true;
+  const dir = Math.sign(x1 - esc.x);
+  enderezar();
+  girarHacia(dir * GIRO_CAMINAR, 0.25);
+  await wait(220);
+  if (token !== esc.token) return false;
+  const pxs = velocidadPx(vel);
+  const dur = Math.max(0.5, Math.abs(x1 - esc.x) / pxs);
+  andarLibre.activo = true;
+  andarLibre.ritmo = clamp(pxs / PX_POR_SEG, 0.6, 2);
+  const ok = await new Promise((resolve) => { esc.tween = { x0: esc.x, x1, t0: now(), dur, resolve }; });
+  if (token !== esc.token) return false;
+  andarLibre.activo = false;
+  if (!ok) return false;
+  girarHacia(0, 0.4);                                   // de frente al usuario al llegar
+  return true;
+}
+
+function perseguirCursor(segundos, vel) {
+  return new Promise((resolve) => {
+    esc.seguir = { hasta: now() + segundos, vel, token: esc.token, dir: 0, v: 0, resolve };
+  });
+}
+
+function terminarPersecucion(completa) {
+  const sg = esc.seguir;
+  if (!sg) return;
+  esc.seguir = null;
+  andarLibre.activo = false;
+  girarHacia(0, 0.35);
+  sg.resolve(completa);
+}
+
+async function asomarse(borde, vel = 0.8) {
+  const token = esc.token;
+  const ok = await caminarA(xAsomada(borde), { vel, libre: true });
+  if (!ok || token !== esc.token) return false;
+  girarHacia(borde === 'right' ? -35 : 35, 0.5);        // hacia el centro de la pantalla
+  if (vrm?.humanoid.getNormalizedBoneNode('spine')) setBone('spine', { z: borde === 'right' ? 10 : -10 }, 0.6);
+  esc.asomada = true;
+  setLook({ at: 'mouse', head: Math.max(look.head, 0.45) });
+  syncChips('#look-chips', 'mouse');
+  return true;
+}
+
+/**
+ * Entrada por el borde (orden "aparecer" del proceso principal de Electron, su dueño). Mientras dura
+ * (también la espera a los shaders) esc.entrada está puesta: stop/reset/move no la cancelan y las
+ * acciones "desktop" de R.A.M.S. esperan a que termine (manda la última). Solo la cancelan el propio
+ * main (esconderse, ocultar la ventana, otro aparecer) o el usuario al agarrarla; si algo más la
+ * cortara, se la deja dentro de la pantalla en vez de varada fuera del borde.
+ */
+async function aparecer(borde, modo) {
+  borde = DESKTOP_EDGES.includes(borde) ? borde : 'right';
+  clearTimeout(esc.respaldo);
+  cancelarLocomocion(false);
+  const token = esc.token;
+  esc.saliendo = false;
+  let terminar;
+  const entrada = new Promise((r) => { terminar = r; });
+  esc.entrada = entrada;
+  let ok = false;
+  try {
+    if (esc.oculta) {
+      esc.oculta = false;
+      esc.caida = null;
+      esc.x = xFueraDe(borde);
+      esc.y = sueloY();
+      colocar();
+      postState();
+      // que el primer paso no se trabe si los shaders aún se compilan (fuera de la pantalla no se dibuja)
+      await Promise.race([gpuListo, wait(4000)]);
+      if (token !== esc.token) return false;
+    }
+    if (modo === 'asomarse') ok = await asomarse(borde);
+    else if (esc.x >= 0 && esc.x + BOX.w <= innerWidth) { enderezar(); girarHacia(0, 0.35); ok = true; }
+    else ok = await caminarA(xDentroDe(esc.x + BOX.w / 2 < innerWidth / 2 ? 'left' : 'right'));
+    return ok;
+  } finally {
+    if (esc.entrada === entrada) {
+      esc.entrada = null;
+      if (!ok) rescatarEntrada(borde, modo);
+    }
+    terminar();
+  }
+}
+
+/** Red de seguridad: una entrada cortada por algo que no es su dueño no la deja fuera de la pantalla. */
+function rescatarEntrada(borde, modo) {
+  if (esc.oculta || esc.saliendo || esc.drag || esc.caida || esc.tween || esc.seguir || !visible) return;
+  const destino = modo === 'asomarse' ? xAsomada(borde) : xDentroDe(borde);
+  const fuera = borde === 'left' ? esc.x < destino : esc.x > destino;
+  if (!fuera) return;
+  esc.x = destino;
+  girarHacia(0, 0.35);
+  colocar();
+}
+
+/** Espera a que no haya ninguna entrada por el borde en curso (un aparecer puede sustituir a otro). */
+async function esperarEntrada() {
+  while (esc.entrada) await esc.entrada;
+}
+
+/** La locomoción en curso es del proceso principal (entrada o salida por el borde): no se toca. */
+const locomocionDeElectron = () => DESKTOP && !!(esc.entrada || esc.saliendo);
+
+/** Sale caminando por el borde más cercano y al terminar llama a amadeusDesktop.hidden(). */
+async function esconderse() {
+  clearTimeout(esc.respaldo);
+  if (esc.oculta) { ad('hidden'); return true; }
+  esc.saliendo = true;
+  if (esc.drag || esc.caida) return false;              // se reanuda al soltarla o al tocar el suelo
+  cancelarLocomocion(false);
+  const token = esc.token;
+  let ok = false;
+  try { ok = await caminarA(xFueraDe(bordeCercano()), { vel: 1.15, libre: true }); } catch { ok = false; }
+  if (!ok || token !== esc.token || !esc.saliendo) return false;
+  esc.saliendo = false;
+  esc.oculta = true;
+  enderezar();
+  pedirInteractivo(false);
+  postState();
+  ad('hidden');
+  return true;
+}
+
+async function buscarUsuario(vel) {
+  const token = esc.token;
+  const cx = esc.cursor ? esc.cursor.x : innerWidth / 2;
+  const desdeIzquierda = esc.x + BOX.w / 2 <= cx;       // se queda al lado del cursor, no encima
+  const centro = cx + (desdeIzquierda ? -1 : 1) * BOX.w * 0.55;
+  const ok = await caminarA(limiteX(centro - BOX.w / 2), { vel });
+  if (!ok || token !== esc.token) return false;
+  setLook({ at: 'mouse', head: Math.max(look.head, 0.5) });
+  syncChips('#look-chips', 'mouse');
+  girarHacia(desdeIzquierda ? 20 : -20, 0.4);           // un poco hacia el cursor
+  if (vrm) { try { startGesture('wave', { side: desdeIzquierda ? 'left' : 'right' }); } catch {} }
+  return true;
+}
+
+async function pasear(segundos, vel) {
+  const token = esc.token;
+  const hasta = now() + segundos;
+  while (token === esc.token && now() < hasta) {
+    let destino = Math.random() * Math.max(1, innerWidth - BOX.w);
+    if (Math.abs(destino - esc.x) < 120) destino = esc.x + (destino >= esc.x ? 160 : -160);
+    const ok = await caminarA(limiteX(destino), { vel: vel * 0.8 });
+    if (!ok || token !== esc.token) return false;
+    if (now() >= hasta) break;
+    await wait(600 + Math.random() * 1000);
+  }
+  return token === esc.token;
+}
+
+/** Comando "desktop" (de R.A.M.S. por /api/command): locomoción por la pantalla. */
+function comandoEscritorio(c) {
+  if (!DESKTOP) fail('El comando desktop solo funciona en visores de escritorio (?desktop=1).');
+  const action = c.action;
+  if (!DESKTOP_ACTIONS.includes(action)) fail(`Acción desconocida "${action}". Acciones: ${DESKTOP_ACTIONS.join(', ')}`);
+  if (c.edge != null && !DESKTOP_EDGES.includes(c.edge)) fail(`edge debe ser ${DESKTOP_EDGES.join(' o ')}.`);
+  if (!visible || esc.oculta || esc.saliendo) fail('oculta');
+  if (esc.drag) fail('arrastrada');
+  if (action === 'walk_to' && num(c.x, null) === null) fail('walk_to requiere "x" (0..1, o px con unit:"px").');
+  if (action === 'chase_cursor' && !esc.cursor) fail('sin cursor global (este sistema no informa la posición del ratón)');
+  const turno = ++esc.diferida;              // la última acción manda (y "stop" descarta la que esperaba)
+  if (esc.entrada) {
+    // la entrada por el borde es del proceso principal de Electron: no se corta, la acción va después
+    if (action === 'stop') return { result: { action: 'stop', entrando: true } };
+    const done = esperarEntrada().then(() => {
+      if (turno !== esc.diferida || !visible || esc.oculta || esc.saliendo || esc.drag || esc.entrada) return false;
+      try { return accionEscritorio(c).done; } catch (err) { console.warn('desktop (tras la entrada):', err); return false; }
+    });
+    anotar(`desktop ${action}: espera a que termine la entrada por el borde.`, { type: 'desktop', action });
+    return { result: { action, tras: 'entrada' }, done };
+  }
+  return accionEscritorio(c);
+}
+
+/** Ejecuta una acción "desktop" ya validada (con la ventana visible y sin entrada en curso). */
+function accionEscritorio(c) {
+  const action = c.action;
+  const vel = clamp(num(c.speed, 1), DESKTOP_LIMITS.speedMin, DESKTOP_LIMITS.speedMax);
+  const segundos = (d) => clamp(num(c.seconds, d), 0.5, DESKTOP_LIMITS.secondsMax);
+  const sinFallo = (p) => p.catch((err) => { console.warn('desktop:', err); return false; });
+  switch (action) {
+    case 'walk_to': {
+      const xv = num(c.x, null);
+      if (xv === null) fail('walk_to requiere "x" (0..1, o px con unit:"px").');
+      // x = centro del avatar: fracción del ancho útil (caja entera visible) o px CSS con unit:"px"
+      const centro = c.unit === 'px'
+        ? clamp(xv, 0, DESKTOP_LIMITS.pxMax)
+        : BOX.w / 2 + clamp(xv, 0, 1) * Math.max(0, innerWidth - BOX.w);
+      cancelarLocomocion(false);
+      const destino = limiteX(centro - BOX.w / 2);
+      const seconds = +(0.22 + Math.abs(destino - esc.x) / velocidadPx(vel)).toFixed(2);
+      return { result: { action, x: Math.round(destino + BOX.w / 2), seconds }, done: sinFallo(caminarA(destino, { vel })) };
+    }
+    case 'peek': {
+      const edge = c.edge || bordeCercano();
+      cancelarLocomocion(false);
+      return { result: { action, edge }, done: sinFallo(asomarse(edge, Math.min(vel, 1))) };
+    }
+    case 'chase_cursor': {
+      if (!esc.cursor) fail('sin cursor global (este sistema no informa la posición del ratón)');
+      const s = segundos(8);
+      cancelarLocomocion(false);
+      return { result: { action, seconds: s }, done: perseguirCursor(s, vel) };
+    }
+    case 'seek_user': {
+      cancelarLocomocion(false);
+      return { result: { action }, done: sinFallo(buscarUsuario(vel)) };
+    }
+    case 'wander': {
+      const s = segundos(10);
+      cancelarLocomocion(false);
+      return { result: { action, seconds: s }, done: sinFallo(pasear(s, vel)) };
+    }
+    default: {                                          // 'stop'
+      cancelarLocomocion(true);
+      enderezar();
+      return { result: { action: 'stop' } };
+    }
+  }
+}
+
+/** Avance por fotograma: caminar, persecución del cursor, caída y peso de la zancada. */
+function actualizarEscritorio(t, dt) {
+  let mover = false;
+  const tw = esc.tween;
+  if (tw) {
+    const k = clamp((t - tw.t0) / tw.dur, 0, 1);
+    esc.x = lerp(tw.x0, tw.x1, k * k * (3 - 2 * k));    // misma curva que updateRoot con walk
+    mover = true;
+    if (k >= 1) { esc.tween = null; tw.resolve(true); }
+  }
+  const sg = esc.seguir;
+  if (sg) {
+    if (t >= sg.hasta || !esc.cursor || sg.token !== esc.token) {
+      terminarPersecucion(true);
+    } else {
+      const diff = limiteX(esc.cursor.x - BOX.w / 2) - esc.x;
+      if (Math.abs(diff) > 28) {
+        const dir = Math.sign(diff);
+        if (sg.dir !== dir) { sg.dir = dir; sg.v = Math.min(sg.v, 60); girarHacia(dir * GIRO_CAMINAR, 0.2); }
+        sg.v = Math.min(velocidadPx(sg.vel * 1.35), sg.v + 900 * dt);
+        esc.x += dir * Math.min(Math.abs(diff), sg.v * dt);
+        andarLibre.activo = true;
+        andarLibre.ritmo = clamp(sg.v / PX_POR_SEG, 0.6, 2);
+        mover = true;
+      } else if (sg.dir !== 0) {
+        sg.dir = 0;
+        sg.v = 0;
+        andarLibre.activo = false;
+        girarHacia(0, 0.3);
+      }
+    }
+  }
+  const cd = esc.caida;
+  if (cd) {
+    const k = clamp((t - cd.t0) / cd.dur, 0, 1);
+    esc.y = lerp(cd.y0, sueloY(), k * k);
+    mover = true;
+    if (k >= 1) {
+      esc.caida = null;
+      if (esc.saliendo) esconderse();
+    }
+  }
+  andarLibre.peso = lerp(andarLibre.peso, andarLibre.activo ? 1 : 0, Math.min(1, dt * 7));
+  if (!andarLibre.activo && andarLibre.peso < 0.005) andarLibre.peso = 0;
+  if (mover) colocar();
+}
+
+// ---- arrastrar, tocar y clic derecho sobre la caja
+function alPulsar(e) {
+  if (e.button !== 0 || esc.oculta) return;
+  const p = { x: e.clientX, y: e.clientY };
+  if (!sobreElCuerpo(p, true)) return;                  // fuera del cuerpo no se la agarra
+  e.preventDefault();
+  cancelarLocomocion(true);
+  enderezar();
+  esc.caida = null;
+  try { stage.setPointerCapture(e.pointerId); } catch {}
+  esc.drag = { id: e.pointerId, dx: p.x - esc.x, dy: p.y - esc.y, x0: p.x, y0: p.y, movido: false };
+  pedirInteractivo(true);
+}
+
+function alMover(e) {
+  const d = esc.drag;
+  if (!d || e.pointerId !== d.id) return;
+  if (!d.movido && Math.hypot(e.clientX - d.x0, e.clientY - d.y0) > 6) {
+    d.movido = true;
+    document.body.classList.add('arrastrando');
+  }
+  if (!d.movido) return;
+  esc.x = limiteX(e.clientX - d.dx);
+  esc.y = clamp(e.clientY - d.dy, -BOX.h * 0.5, sueloY());
+  colocar();
+}
+
+function alSoltar(e, cancelado) {
+  const d = esc.drag;
+  if (!d || e.pointerId !== d.id) return;
+  esc.drag = null;
+  document.body.classList.remove('arrastrando');
+  try { stage.releasePointerCapture(e.pointerId); } catch {}
+  if (!d.movido) {
+    if (!cancelado) ad('event', 'toque', {});           // pointerup sin arrastre
+  } else {
+    const suelo = sueloY();
+    const altura = suelo > 0 ? clamp((suelo - esc.y) / suelo, 0, 1) : 0;
+    if (!cancelado) ad('event', 'soltada', { altura: +altura.toFixed(3) });
+    const caer = suelo - esc.y;
+    if (caer > 1) esc.caida = { y0: esc.y, t0: now(), dur: Math.max(0.12, Math.sqrt((2 * caer) / GRAVEDAD_PX)) };
+  }
+  if (esc.cursor) evaluarInteractivo(); else pedirInteractivo(false);
+  if (esc.saliendo && !esc.caida) esconderse();
+}
+
+// ---- órdenes y visibilidad del proceso principal de Electron (tabla de §C2.5.5)
+function fijarEstado(o) {
+  esc.estado = {
+    aburrimiento: clamp(num(o.aburrimiento, 0), 0, 1),
+    fatiga: clamp(num(o.fatiga, 0), 0, 1),
+    valencia: clamp(num(o.valencia, 0), -1, 1),
+  };
+  // solo modula los reflejos de reposo y el paso (no decide nada)
+  reflejoReposo = clamp(1 + 0.3 * esc.estado.aburrimiento - 0.4 * esc.estado.fatiga, 0.5, 1.4);
+}
+
+function relayout() {
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  resize();
+  if (esc.oculta) esc.x = xFueraDe(esc.x + BOX.w / 2 < 0 ? 'left' : 'right');
+  else if (!esc.tween && !esc.drag && !esc.saliendo && !esc.seguir && !esc.entrada) esc.x = limiteX(esc.x);
+  if (!esc.drag && !esc.caida) esc.y = sueloY();
+  colocar();
+  reportarCaja(true);
+}
+
+function alOrden(o) {
+  if (!o || typeof o !== 'object') return;
+  const avisar = (p) => Promise.resolve(p).catch((err) => console.warn(`orden ${o.accion}:`, err));
+  switch (o.accion) {
+    case 'aparecer': avisar(aparecer(o.borde, o.modo === 'asomarse' ? 'asomarse' : 'entrar')); break;
+    case 'esconderse': avisar(esconderse()); break;
+    case 'estado': fijarEstado(o); break;
+    case 'suelo':
+      esc.suelo = Math.round(clamp(num(o.inferior, 0), 0, innerHeight * 0.5));
+      if (!esc.drag && !esc.caida) { esc.y = sueloY(); colocar(); }
+      break;
+    case 'relayout': relayout(); break;
+    case 'camara': {   // indicador visible de cámara abierta (§C2.13): lo decide R.A.M.S., aquí solo se pinta
+      const ojo = $('#ojo-camara');
+      if (ojo) ojo.hidden = o.activa !== true;
+      break;
+    }
+    default: console.debug('Orden de escritorio desconocida:', o.accion);
+  }
+}
+
+function alVisibilidad(v) {
+  v = !!v;
+  if (v === visible) return;
+  visible = v;
+  clearTimeout(esc.respaldo);
+  if (v) {
+    reanudarRender();
+    reportarCaja(true);
+    // respaldo: si se muestra la ventana sin orden "aparecer", entra caminando igualmente
+    if (esc.oculta) esc.respaldo = setTimeout(() => { if (visible && esc.oculta) aparecer('right', 'entrar'); }, 700);
+  } else {
+    cancelarLocomocion(false);
+    esc.diferida++;                    // una acción que esperaba a la entrada ya no tiene sentido
+    esc.drag = null;
+    esc.caida = null;
+    esc.saliendo = false;
+    esc.oculta = true;
+    document.body.classList.remove('arrastrando');
+    pedirInteractivo(false);
+    pausarRender();
+  }
+  postState();
+}
+
+function iniciarEscritorio() {
+  esc.y = sueloY();
+  if (AD_ORDENES) { esc.oculta = true; esc.x = xFueraDe('right'); }   // espera a "aparecer"
+  else { esc.oculta = false; esc.x = xDentroDe('right'); }           // en un navegador: visible ya
+  colocar();
+  window.addEventListener('resize', relayout);
+  window.addEventListener('pointermove', (e) => actualizarCursor({ x: e.clientX, y: e.clientY }), { passive: true });
+  stage.addEventListener('pointerdown', alPulsar);
+  stage.addEventListener('pointermove', alMover);
+  stage.addEventListener('pointerup', (e) => alSoltar(e, false));
+  stage.addEventListener('pointercancel', (e) => alSoltar(e, true));
+  stage.addEventListener('lostpointercapture', (e) => alSoltar(e, true));
+  stage.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    if (sobreElCuerpo({ x: e.clientX, y: e.clientY }, true)) ad('openChat');   // abre el chat (acción del usuario)
+  });
+  stage.addEventListener('wheel', (e) => e.preventDefault(), { passive: false });
+  if (AD) {
+    ad('onCursor', (p) => actualizarCursor(p));
+    ad('onOrder', (o) => alOrden(o));
+    ad('onVisibility', (v) => alVisibilidad(v));
+  }
+}
+
 // ===================================================================== conexión con la IA (SSE)
 const conn = $('#conn');
 function setConn(state, text) {
   conn.className = `pill ${state}`;
   conn.querySelector('span').textContent = text;
 }
+let fuenteSse = null;
+// Modelo con el que arrancar sin ?model=: lo dice el servidor en el primer "hello" (último load_model
+// confirmado, VTUBER_AI_MODELO o el primer .vrm de models/). Así el overlay de Amadeus Desktop, que se
+// abre sin ?model=, carga el mismo modelo propio que el panel también tras recargarse.
+let avisarModeloInicial;
+const modeloDelServidor = new Promise((r) => { avisarModeloInicial = r; });
 function connect() {
-  const es = new EventSource(`/api/events${OBS ? '?obs=1' : ''}`);
-  es.addEventListener('hello', () => { setConn('ok', 'IA conectada'); postState(); });
+  const q = new URLSearchParams();
+  if (OBS) q.set('obs', '1');
+  if (DESKTOP) q.set('desktop', '1');
+  const qs = q.toString();
+  fuenteSse?.close();
+  const es = new EventSource(`/api/events${qs ? `?${qs}` : ''}`);
+  fuenteSse = es;
+  es.addEventListener('hello', (ev) => {
+    let h = {};
+    try { h = JSON.parse(ev.data) || {}; } catch { h = {}; }
+    viewerId = typeof h.id === 'string' ? h.id : null;
+    avisarModeloInicial(typeof h.defaultModel === 'string' && h.defaultModel ? h.defaultModel : null);
+    setConn('ok', 'IA conectada');
+    postState();
+  });
   es.addEventListener('command', async (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
@@ -1148,15 +2168,19 @@ function connect() {
         results.push({ ok: false, type: c?.type, error: err.message });
       }
     }
+    // viewerId: con panel y overlay a la vez, el servidor prefiere el ack del panel (el overlay ignora x/z…)
     fetch('/api/ack', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: msg.id, results }),
+      body: JSON.stringify({ id: msg.id, viewerId, results }),
     }).catch(() => {});
   });
   es.onerror = () => setConn('err', 'Servidor desconectado — reintentando…');
 }
 connect();
+// Una página guardada en la caché atrás/adelante no debe seguir contando como visor (ni recibir comandos).
+window.addEventListener('pagehide', () => { fuenteSse?.close(); fuenteSse = null; });
+window.addEventListener('pageshow', (e) => { if (e.persisted) connect(); });
 
 // ===================================================================== interfaz
 const logEl = $('#log');
@@ -1166,7 +2190,7 @@ function logEntry(source, cmd, res) {
   const li = document.createElement('li');
   const time = new Date().toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   const src = String(source);
-  const label = { api: 'IA', mcp: 'IA · MCP', ia: 'IA', manual: 'Manual', secuencia: 'Secuencia', sistema: 'Sistema' }[src] || src;
+  const label = { api: 'IA', mcp: 'IA · MCP', ia: 'IA', rams: 'R.A.M.S.', manual: 'Manual', secuencia: 'Secuencia', sistema: 'Sistema' }[src] || src;
   const meta = document.createElement('div');
   meta.className = 'meta';
   meta.innerHTML = `<span class="src ${src}"></span><span></span>`;
@@ -1225,7 +2249,12 @@ chips('#look-chips', Object.entries(LOOK_LABELS), (l) => runLocal({ type: 'look'
 chips('#hand-chips', HAND_SHAPES.map((h) => [h, HAND_LABELS[h]]), (h) => runLocal({ type: 'hand', side: $('#hand-side').value, shape: h }));
 chips('#camera-chips', CAMERA_PRESETS.map((c) => [c, CAMERA_LABELS[c]]), (c) => runLocal({ type: 'camera', preset: c }));
 chips('#bg-chips', BACKGROUNDS.map((b) => [b, BG_LABELS[b]]), (b) => runLocal({ type: 'background', mode: b }));
-syncChips('#emotion-chips', 'neutral'); syncChips('#pose-chips', 'relaxed'); syncChips('#look-chips', 'camera');
+const THEME_LABELS = { amadeus: 'Amadeus (Kurisu)', none: 'Ninguno' };
+if ($('#theme-chips')) {
+  chips('#theme-chips', THEMES.map((n) => [n, THEME_LABELS[n] || n]), (n) => runLocal({ type: 'theme', name: n }));
+  syncChips('#theme-chips', temaDeseado);
+}
+syncChips('#emotion-chips', 'neutral'); syncChips('#pose-chips', 'relaxed'); syncChips('#look-chips', LOOK_INICIAL);
 syncChips('#camera-chips', cameraPreset); syncChips('#bg-chips', 'gradient');
 
 // hablar
@@ -1369,7 +2398,8 @@ try { const t = localStorage.getItem('vtuber-tab'); if (t) document.querySelecto
 const togglePanel = () => { document.body.classList.toggle('panel-hidden'); setTimeout(resize, 0); };
 $('#toggle-panel').onclick = togglePanel;
 window.addEventListener('keydown', (e) => {
-  if (e.key.toLowerCase() === 'h' && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName)) togglePanel();
+  if (OBS) return;
+  if (e.key?.toLowerCase() === 'h' && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName)) togglePanel();
 });
 
 // voz
@@ -1427,30 +2457,85 @@ function loadFile(file) {
   loadModel(URL.createObjectURL(file), file.name).catch(() => {});
 }
 $('#file-input').onchange = (e) => loadFile(e.target.files[0]);
-let dragDepth = 0;
-window.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
-window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
-window.addEventListener('dragover', (e) => e.preventDefault());
-window.addEventListener('drop', (e) => {
-  e.preventDefault();
-  dragDepth = 0;
-  document.body.classList.remove('dragging');
-  loadFile(e.dataTransfer.files[0]);
-});
+if (!DESKTOP) {
+  // arrastrar un .vrm a la ventana (en el escritorio no: la ventana deja pasar los clics)
+  let dragDepth = 0;
+  window.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; document.body.classList.add('dragging'); });
+  window.addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove('dragging');
+    loadFile(e.dataTransfer.files[0]);
+  });
+}
 
-// parámetros de URL: ?bg=green&camera=bust&model=archivo.vrm
-if (params.get('bg')) {
+// parámetros de URL: ?bg=green&camera=bust&model=archivo.vrm (en el escritorio el fondo es siempre transparente)
+if (DESKTOP) {
+  setBackground('transparent');
+} else if (params.get('bg')) {
   try { setBackground(params.get('bg')); } catch {}
 } else if (OBS) {
   setBackground('transparent');
 }
 if (params.get('camera') && CAMERA_PRESETS.includes(params.get('camera'))) cameraPreset = params.get('camera');
+else if (DESKTOP) cameraPreset = 'full';
 else if (OBS) cameraPreset = 'bust';
 syncChips('#camera-chips', cameraPreset);
 
-// expuesto para depuración y para IAs que corren dentro de la página
-window.vtuber = { execute: (c) => runLocal(c, 'api'), state: snapshot, COMMANDS, get vrm() { return vrm; } };
+// visibilidad sin Electron: la de la pestaña
+if (!AD_VISIBILIDAD) {
+  document.addEventListener('visibilitychange', () => {
+    visible = document.visibilityState === 'visible';
+    postState();
+  });
+}
+if (DESKTOP) iniciarEscritorio();
+if (!AD_VISIBILIDAD || visible) reanudarRender();     // dentro de Electron arranca con la ventana oculta
 
-// arranque
-const [startUrl, startLabel] = await resolveModelUrl(params.get('model') || 'sample');
-loadModel(startUrl, startLabel).catch((err) => console.error(err));
+// expuesto para depuración y para IAs que corren dentro de la página
+window.vtuber = {
+  execute: (c) => runLocal(c, 'api'),
+  state: snapshot,
+  COMMANDS,
+  get vrm() { return vrm; },
+  get escritorio() {
+    return DESKTOP ? {
+      x: Math.round(esc.x), y: Math.round(esc.y), oculta: esc.oculta, saliendo: esc.saliendo, visible,
+      interactivo: esc.interactivo, caminando: escritorioEnMovimiento(), render: renderActivo, tema: temaNombre(),
+      frames: framesRender,
+    } : null;
+  },
+  /** Depuración del hit-test: ¿el punto (px CSS de la ventana) cae sobre el cuerpo? (píxel y raycast) */
+  probarHit(x, y) {
+    if (!DESKTOP || !vrm) return null;
+    const lx = x - esc.x, ly = y - esc.y;
+    const dentro = sobreElCuerpo({ x, y }, true);
+    hitNdc.set((lx / BOX.w) * 2 - 1, -(ly / BOX.h) * 2 + 1);
+    hitRay.setFromCamera(hitNdc, camera);
+    let n = 0, error = null;
+    try { n = hitRay.intersectObject(vrm.scene, true).length; } catch (err) { error = String(err?.message || err); }
+    return {
+      dentro, porPixel: hitPorPixel, intersecciones: n, error,
+      ndc: [+hitNdc.x.toFixed(3), +hitNdc.y.toFixed(3)],
+    };
+  },
+};
+
+// arranque: ?model= manda; si no, el modelo que indica el servidor ("hello"); si no llega a tiempo o
+// falla al cargar, el de ejemplo (CDN). Una carga pedida mientras tanto (load_model) no se pisa.
+const modeloPedido = params.get('model');
+const modeloInicial = modeloPedido
+  || await Promise.race([modeloDelServidor, wait(2500).then(() => null)])
+  || 'sample';
+if (!loadToken) {
+  const [startUrl, startLabel] = await resolveModelUrl(modeloInicial);
+  loadModel(startUrl, startLabel).catch((err) => {
+    console.error(err);
+    if (!modeloPedido && startUrl !== DEFAULT_MODEL_URL && !vrm && !cargaEnCurso) {
+      console.warn(`[visor] No se pudo cargar "${modeloInicial}"; se usa el modelo de ejemplo.`);
+      loadModel(DEFAULT_MODEL_URL, 'Modelo de ejemplo').catch((e) => console.error(e));
+    }
+  });
+}
