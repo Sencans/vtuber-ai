@@ -16,6 +16,7 @@ import {
   DEFAULT_MODEL_URL, EMOTIONS, EMOTION_LABELS, VISEMES, POSES, GESTURES, HAND_SHAPES,
   LOOK_TARGETS, CAMERA_PRESETS, BACKGROUNDS, COMMANDS, COMMAND_TYPES,
   DESKTOP_ACTIONS, DESKTOP_EDGES, DESKTOP_LIMITS, DESKTOP_BOX, THEMES, THEME_LIMITS, RESTRICTED_TYPES,
+  speakBubble,
 } from '/protocol.js';
 
 // ===================================================================== utilidades
@@ -586,7 +587,8 @@ function setBackground(mode) {
 }
 
 // ===================================================================== voz y labios
-const speech = { active: false, text: '', start: 0, cps: 14, tts: false, boundaryIdx: 0, boundaryAt: 0, offset: 0, token: 0 };
+// bubble: si el speak en curso mostró el globo (solo entonces lo esconde al terminar o al cortarse).
+const speech = { active: false, text: '', start: 0, cps: 14, tts: false, boundaryIdx: 0, boundaryAt: 0, offset: 0, token: 0, bubble: false };
 const visemes = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
 const tts = { enabled: !OBS || params.has('tts'), voiceURI: '', pitch: 1.1, unlocked: false };
 try {
@@ -663,7 +665,9 @@ function stopSpeech() {
   speech.token++;
   if (speech.active) {
     speech.active = false;
-    hideBubble(200);
+    // se esconde el globo del habla que se corta, si lo mostró (uno con bubble:false no tiene globo)
+    if (speech.bubble) hideBubble(200);
+    speech.bubble = false;
   }
   try { if ('speechSynthesis' in window) speechSynthesis.cancel(); } catch {}
 }
@@ -701,12 +705,18 @@ function speak(c) {
   if (c.emotion && c.emotion !== 'neutral' && vrm && !vrm.expressionManager.getExpression(c.emotion)) {
     fail(`Emoción "${c.emotion}" no existe. Disponibles: ${availableExpressions.join(', ')}`);
   }
+  // bubble:false = habla sin globo de texto; tampoco esconde ni reinicia el globo que se esté
+  // desvaneciendo de otro speak. Por defecto true (panel manual, MCP y clientes antiguos).
+  const conGlobo = speakBubble(c.bubble);
+  if (conGlobo === null) fail('"bubble" debe ser true o false.');
   stopSpeech();
   const token = ++speech.token;
   const rate = clamp(num(c.rate, 1), 0.5, 2);
   const pitch = clamp(num(c.pitch, tts.pitch), 0, 2);
-  Object.assign(speech, { active: true, text, start: now(), cps: 14 * rate, tts: false, boundaryIdx: 0, boundaryAt: 0, offset: 0 });
-  showBubble(text);
+  Object.assign(speech, {
+    active: true, text, start: now(), cps: 14 * rate, tts: false, boundaryIdx: 0, boundaryAt: 0, offset: 0, bubble: conGlobo,
+  });
+  if (conGlobo) showBubble(text);
   if (c.emotion && vrm) applyExpression({ name: c.emotion, value: num(c.emotionValue, 0.85) });
   if (c.gesture && vrm) startGesture(c.gesture, { side: c.side });
 
@@ -737,10 +747,11 @@ function speak(c) {
   const finished = done.then(() => {
     if (token !== speech.token) return;
     speech.active = false;
-    hideBubble();
+    if (speech.bubble) hideBubble();
+    speech.bubble = false;
     if (c.emotion && c.keepEmotion !== true) clearEmotions(0.6);
   });
-  return { result: { estimatedSeconds: +est.toFixed(1), voice: useTts ? 'tts' : 'silent' }, done: finished };
+  return { result: { estimatedSeconds: +est.toFixed(1), voice: useTts ? 'tts' : 'silent', bubble: conGlobo }, done: finished };
 }
 
 const VOWEL_MAP = { a: 'aa', á: 'aa', e: 'ee', é: 'ee', i: 'ih', í: 'ih', y: 'ih', o: 'oh', ó: 'oh', u: 'ou', ú: 'ou', ü: 'ou' };
@@ -902,10 +913,14 @@ function composeBones(t, dt) {
   hv.y += followSmooth.yaw * 0.6; nv.y += followSmooth.yaw * 0.4;
   hv.x -= followSmooth.pitch * 0.6; nv.x -= followSmooth.pitch * 0.4;
 
-  // aplicar al modelo
+  // aplicar al modelo. Las poses y gestos están en la convención de VRM 1.0; en un VRM 0.x
+  // (girado 180° por rotateVRM0) los ejes X y Z de los huesos normalizados quedan invertidos,
+  // así que se niegan: R_y(π)·R(x,y,z)·R_y(π)⁻¹ = R(−x, y, −z). Sin esto los brazos «bajados»
+  // de la pose relajada suben y los dedos se doblan hacia atrás.
+  const vrm0 = vrm.meta?.metaVersion === '0';
   for (const [b, v] of out) {
     const node = vrm.humanoid.getNormalizedBoneNode(b);
-    if (node) node.rotation.set(v.x, v.y, v.z);
+    if (node) node.rotation.set(vrm0 ? -v.x : v.x, v.y, vrm0 ? -v.z : v.z);
   }
   vrm.scene.position.y = rootY;
 }
@@ -1147,6 +1162,9 @@ async function cargarModelo(url, label, token) {
         temaActivo = envolverTema(mod.aplicarTemaAmadeus(next, {
           THREE, rim: temaOpciones.rim, scanlines: temaOpciones.scanlines,
           escena: scene, avatarRoot, modoEscritorio: DESKTOP,
+          // La paleta de Kurisu, la corbata y las medias solo se aplican al modelo de ejemplo: un
+          // .vrm propio del usuario conserva sus colores y recibe solo rim, scanlines y marco.
+          paleta: modelUrl === DEFAULT_MODEL_URL,
         }));
       }
     } catch (err) {
@@ -2135,6 +2153,7 @@ function setConn(state, text) {
   conn.querySelector('span').textContent = text;
 }
 let fuenteSse = null;
+let buildVisor = null;   // huella del código con el que se cargó esta página (del primer "hello")
 // Modelo con el que arrancar sin ?model=: lo dice el servidor en el primer "hello" (último load_model
 // confirmado, VTUBER_AI_MODELO o el primer .vrm de models/). Así el overlay de Amadeus Desktop, que se
 // abre sin ?model=, carga el mismo modelo propio que el panel también tras recargarse.
@@ -2152,6 +2171,11 @@ function connect() {
     let h = {};
     try { h = JSON.parse(ev.data) || {}; } catch { h = {}; }
     viewerId = typeof h.id === 'string' ? h.id : null;
+    // El servidor se reinició con otro código del visor: recargar para no seguir con el app.js viejo.
+    if (typeof h.build === 'string' && h.build) {
+      if (buildVisor && h.build !== buildVisor) { location.reload(); return; }
+      buildVisor = h.build;
+    }
     avisarModeloInicial(typeof h.defaultModel === 'string' && h.defaultModel ? h.defaultModel : null);
     setConn('ok', 'IA conectada');
     postState();
@@ -2445,16 +2469,46 @@ async function refreshModelList() {
   fillSelect('#model-select', [['', 'Elegir modelo…'], ['sample', 'Modelo de ejemplo'], ...list.map((m) => [m.name, m.name])]);
 }
 refreshModelList();
+/**
+ * Pide a TODOS los visores (este panel y el overlay de Amadeus Desktop) que carguen un modelo de
+ * models/. El servidor lo recuerda como modelo inicial para los visores que se conecten después.
+ * Si no hay servidor (página abierta sin él), lo carga solo aquí.
+ */
+async function cargarEnTodos(nombre) {
+  try {
+    const r = await fetch('/api/command', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Source': 'panel' },
+      body: JSON.stringify({ type: 'load_model', url: nombre }),
+    });
+    if (r.ok) return;
+  } catch { /* sin servidor: solo local */ }
+  runLocal({ type: 'load_model', url: nombre });
+}
 $('#model-select').onchange = () => {
   const v = $('#model-select').value;
-  if (v) runLocal({ type: 'load_model', url: v });
+  if (v) cargarEnTodos(v);
 };
-function loadFile(file) {
+async function loadFile(file) {
   if (!file || !/\.vrm$/i.test(file.name)) {
     logEntry('manual', { type: 'load_model', file: file?.name }, { ok: false, error: 'Elige un archivo .vrm' });
     return;
   }
-  loadModel(URL.createObjectURL(file), file.name).catch(() => {});
+  // Se sube a models/ para que el overlay del escritorio (y cualquier visor nuevo) use el mismo modelo.
+  setOverlay('Subiendo modelo…');
+  try {
+    const r = await fetch('/api/models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
+      body: file,
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    refreshModelList();
+    await cargarEnTodos(j.name);
+  } catch (err) {
+    console.warn('[visor] No se pudo subir el modelo; se carga solo en esta pestaña:', err?.message || err);
+    loadModel(URL.createObjectURL(file), file.name).catch(() => {});
+  }
 }
 $('#file-input').onchange = (e) => loadFile(e.target.files[0]);
 if (!DESKTOP) {

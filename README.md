@@ -115,7 +115,7 @@ Respuestas de error de `POST /api/command`:
 
 | type | Para qué | Ejemplo |
 |---|---|---|
-| `speak` | Hablar con voz, globo y labios | `{"type":"speak","text":"Hola","emotion":"happy","gesture":"wave"}` |
+| `speak` | Hablar con voz, labios y globo de texto (`"bubble":false` = sin globo) | `{"type":"speak","text":"Hola","emotion":"happy","gesture":"wave"}` |
 | `expression` | Cara: happy, angry, sad, relaxed, surprised, neutral | `{"type":"expression","name":"surprised","hold":2}` |
 | `gesture` | wave, nod, shake_head, bow, tilt_head, jump, clap, shrug, cheer, point, dance, laugh, look_around, think, surprise | `{"type":"gesture","name":"dance","loop":true}` |
 | `pose` | relaxed, tpose, apose, arms_up, hands_on_hips, arms_crossed, thinking, shy | `{"type":"pose","name":"hands_on_hips"}` |
@@ -134,6 +134,19 @@ Si envías una **lista** de comandos, se ejecutan **a la vez**; usa `sequence` p
 
 **Convención de ejes** (vista desde el avatar): `x+` inclinar adelante / mirar abajo, `y+` girar hacia **su** izquierda,
 `z+` ladear hacia **su** derecha. Brazos: `leftUpperArm z:-70` baja el brazo izquierdo, `rightUpperArm z:70` baja el derecho.
+
+### `speak`
+
+`text` (obligatorio, ≤ 2000 caracteres), `emotion`, `gesture`, `rate` 0.5..2, `pitch` 0..2, `lang`, `voice`, `tts` y
+`bubble`. **`bubble`** (bool, por defecto `true`) decide si aparece el **globo de texto** sobre el avatar mientras habla:
+con `false` habla (voz y labios) **sin globo**, y tampoco esconde ni reinicia el globo que otro `speak` esté
+desvaneciendo. También acepta `1`/`0` y `"true"`/`"false"`; otro valor es un error (`"bubble" debe ser true o false.`).
+El panel manual y `avatar_speak` (MCP) siguen mostrando el globo salvo que se pida `bubble:false`; R.A.M.S. lo manda en
+cada `speak` según `VTUBER_AI_BURBUJA` (por defecto `0`: sin globo). La respuesta del visor incluye `bubble`.
+
+```json
+{"type":"speak","text":"Hmph. No lo digas en voz tan alta.","emotion":"angry","bubble":false}
+```
 
 ### `theme`
 

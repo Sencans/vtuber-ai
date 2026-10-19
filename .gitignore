@@ -1,3 +1,6 @@
 node_modules/
 .claude/
 *.log
+
+# Modelos .vrm del usuario: su licencia (p. ej. VRoid Hub) suele prohibir redistribuirlos
+models/*.vrm

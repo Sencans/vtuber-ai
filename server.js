@@ -12,11 +12,11 @@
 // El estado es por instancia de createServer() y por visor: GET /api/state publica el del panel
 // (visor no-escritorio más reciente) y el del overlay solo si no hay otro.
 import http from 'node:http';
-import { readFile, readdir, stat } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { readFile, readdir, stat, writeFile, rename, mkdir, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { readFileSync, readdirSync, realpathSync } from 'node:fs';
 import { HELP, THEMES } from './lib/protocol.js';
 import { handleRpc } from './lib/mcp.js';
 import {
@@ -28,6 +28,23 @@ const PUBLIC_DIR = path.join(ROOT, 'public');
 const MODELS_DIR = path.join(ROOT, 'models');
 const LIB_DIR = path.join(ROOT, 'lib');
 const MAX_BODY = 1024 * 1024;
+
+/**
+ * Huella del código del visor (public/*.js|css|html y lib/protocol.js) al arrancar el servidor. Va en
+ * el "hello": si un visor ya abierto se reconecta a un servidor con otro código, se recarga solo
+ * (si no, seguiría ejecutando el app.js viejo, p. ej. el overlay de Amadeus Desktop).
+ */
+function huellaVisor() {
+  const h = createHash('sha256');
+  try {
+    const archivos = readdirSync(PUBLIC_DIR).filter((f) => /\.(js|css|html)$/i.test(f)).sort()
+      .map((f) => path.join(PUBLIC_DIR, f));
+    archivos.push(path.join(LIB_DIR, 'protocol.js'));
+    for (const f of archivos) { h.update(f); h.update(readFileSync(f)); }
+  } catch { h.update(String(Date.now())); }
+  return h.digest('hex').slice(0, 16);
+}
+const MAX_VRM = 128 * 1024 * 1024;   // tope de un .vrm subido desde el panel
 const DEFAULT_PORT = 3939;
 const MAX_HISTORY = 100;
 // Claves que calcula el servidor: un visor no puede fijarlas con POST /api/state.
@@ -93,6 +110,41 @@ function readBody(req) {
 }
 
 const esJson = (req) => String(req.headers['content-type'] || '').trim().toLowerCase().startsWith('application/json');
+
+/** Binario de un .vrm: tipo no "simple" para CORS, así que un navegador ajeno siempre hace preflight. */
+const esBinarioVrm = (req) => /^(application\/octet-stream|model\/gltf-binary)\s*(;|$)/i
+  .test(String(req.headers['content-type'] || '').trim());
+
+/**
+ * Nombre seguro para un .vrm subido (cabecera X-Filename, codificada con encodeURIComponent): solo el
+ * nombre base, letras/dígitos/espacio/._-, termina en .vrm, ≤ 100 caracteres; si no, null.
+ */
+function nombreVrmSeguro(crudo) {
+  let n;
+  try { n = decodeURIComponent(String(crudo || '')); } catch { return null; }
+  n = n.split(/[\\/]/).pop().normalize('NFC').trim();
+  if (!/^[\p{L}\p{N} ._()-]{1,96}\.vrm$/iu.test(n) || n.startsWith('.')) return null;
+  return n;
+}
+
+const BUILD = huellaVisor();
+
+/** Lee el cuerpo binario con tope de tamaño (rechaza en cuanto lo supera). */
+function readBinary(req, max) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    let aborted = false;
+    const chunks = [];
+    req.on('data', (c) => {
+      if (aborted) return;
+      size += c.length;
+      if (size > max) { aborted = true; reject(new Error('El archivo es demasiado grande')); req.resume(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => { if (!aborted) resolve(Buffer.concat(chunks)); });
+    req.on('error', reject);
+  });
+}
 
 /** Nombre de la fuente (cabecera X-Source) saneado: [a-z0-9_-]{1,32} o 'api'. */
 function fuenteDe(req) {
@@ -339,7 +391,7 @@ export function createServer({ port, host, env = process.env, modelsDir = MODELS
       stateAt: 0,
     };
     viewers.add(viewer);
-    res.write(`event: hello\ndata: ${JSON.stringify({ id: viewer.id, viewers: viewers.size, desktop: viewer.desktop, viewerSeq, defaultModel })}\n\n`);
+    res.write(`event: hello\ndata: ${JSON.stringify({ id: viewer.id, viewers: viewers.size, desktop: viewer.desktop, viewerSeq, defaultModel, build: BUILD })}\n\n`);
     viewer.ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 15000);
     const cerrar = () => {
       clearInterval(viewer.ping);
@@ -367,9 +419,10 @@ export function createServer({ port, host, env = process.env, modelsDir = MODELS
       return send(res, 204, '');
     }
 
-    // Todo POST: JSON y Origin ausente o local.
+    // Todo POST: JSON (o el binario de un .vrm en POST /api/models) y Origin ausente o local.
     if (req.method === 'POST') {
-      if (!esJson(req)) return rechazoOrigen(res, 'Content-Type debe ser application/json.');
+      const subidaVrm = p === '/api/models' && esBinarioVrm(req);
+      if (!esJson(req) && !subidaVrm) return rechazoOrigen(res, 'Content-Type debe ser application/json.');
       if (!origenPermitido(origin)) return rechazoOrigen(res, 'Origen no permitido.');
     }
 
@@ -429,6 +482,31 @@ export function createServer({ port, host, env = process.env, modelsDir = MODELS
 
     if (p === '/api/help') return send(res, 200, HELP);
     if (p === '/api/log') return send(res, 200, history);
+
+    // Subida de un .vrm desde el panel (para que el overlay y los demás visores puedan cargarlo).
+    if (p === '/api/models' && req.method === 'POST') {
+      const nombre = nombreVrmSeguro(req.headers['x-filename']);
+      if (!nombre) return send(res, 400, { ok: false, error: 'Nombre de archivo inválido (debe terminar en .vrm).' });
+      let datos;
+      try { datos = await readBinary(req, MAX_VRM); } catch (e) { return send(res, 413, { ok: false, error: e.message }); }
+      // Un VRM es glTF binario: cabecera "glTF", versión 2 y longitud coherente.
+      if (datos.length < 20 || datos.toString('latin1', 0, 4) !== 'glTF' || datos.readUInt32LE(4) !== 2
+        || datos.readUInt32LE(8) !== datos.length) {
+        return send(res, 400, { ok: false, error: 'El archivo no es un glTF binario (.vrm) válido.' });
+      }
+      const destino = path.join(modelsDir, nombre);
+      if (path.dirname(destino) !== path.resolve(modelsDir)) return send(res, 400, { ok: false, error: 'Ruta inválida' });
+      const temporal = `${destino}.${randomUUID()}.parcial`;
+      try {
+        await mkdir(modelsDir, { recursive: true });
+        await writeFile(temporal, datos);
+        await rename(temporal, destino);
+      } catch (e) {
+        unlink(temporal).catch(() => {});
+        return send(res, 500, { ok: false, error: `No se pudo guardar el modelo: ${e.message}` });
+      }
+      return send(res, 200, { ok: true, name: nombre, url: `/models/${encodeURIComponent(nombre)}`, bytes: datos.length });
+    }
 
     if (p === '/api/models') {
       let files = [];

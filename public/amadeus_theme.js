@@ -198,6 +198,7 @@ export function aplicarTemaAmadeus(vrm, opciones = {}) {
     escena: op.escena ?? null,
     avatarRoot: op.avatarRoot ?? null,
     modoEscritorio: op.modoEscritorio === true,
+    paleta: op.paleta !== false,
   });
 
   const manejador = {
@@ -934,9 +935,11 @@ function crearTema(vrm, THREE, cfg) {
     paso('matrices', () => vrm.scene.updateWorldMatrix?.(true, true));
     const entradas = recorrer();
     res.kurisu = esModeloDeKurisu(vrm.meta);
+    res.paleta = cfg.paleta && !res.kurisu;
     const traeCorbata = entradas.some((e) => RE_CORBATA.test(String(e.m.name || '')) || RE_CORBATA.test(String(e.malla.name || '')));
-    if (!res.kurisu) {
-      // Un modelo que ya es de Kurisu se respeta tal cual: solo recibe rim, scanlines y marco.
+    if (res.paleta) {
+      // Un modelo que ya es de Kurisu (o un .vrm propio, paleta:false) se respeta tal cual:
+      // solo recibe rim, scanlines y marco.
       paso('recoloreado', () => recolorear(entradas));
       paso('medias', () => pintarMedias(entradas));
       if (!traeCorbata) paso('corbata', () => crearCorbata(entradas));

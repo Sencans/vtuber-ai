@@ -662,3 +662,75 @@ test('node --check de todos los .js del proyecto (sin vendor)', () => {
   }
   for (const f of lista) execFileSync(process.execPath, ['--check', f], { stdio: 'pipe' });
 });
+
+// ---------------------------------------------------------------- subida de .vrm desde el panel
+function postBinario(port, ruta, buf, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const h = { 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length, ...headers };
+    const req = http.request({ host: '127.0.0.1', port, method: 'POST', path: ruta, headers: h }, (res) => {
+      let s = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => { s += c; });
+      res.on('end', () => { let json = null; try { json = JSON.parse(s); } catch {} resolve({ status: res.statusCode, json }); });
+    });
+    req.on('error', reject);
+    req.end(buf);
+  });
+}
+
+/** glTF binario mínimo válido en cabecera ("glTF", v2, longitud total coherente). */
+function glbFalso(extra = 32) {
+  const b = Buffer.alloc(12 + extra);
+  b.write('glTF', 0, 'latin1'); b.writeUInt32LE(2, 4); b.writeUInt32LE(b.length, 8);
+  return b;
+}
+
+async function arrancarConModelos() {
+  const modelsDir = mkdtempSync(path.join(tmpdir(), 'vtai-models-'));
+  const app = createServer({ port: 0, host: '127.0.0.1', env: {}, modelsDir });
+  const { port } = await app.listen();
+  return { app, port, modelsDir };
+}
+
+test('POST /api/models guarda un .vrm válido y aparece en la lista y como modelo inicial', async () => {
+  const { app, port, modelsDir } = await arrancarConModelos();
+  try {
+    const r = await postBinario(port, '/api/models', glbFalso(), { 'X-Filename': encodeURIComponent('Kurisu Makise.vrm') });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.name, 'Kurisu Makise.vrm');
+    assert.ok(existsSync(path.join(modelsDir, 'Kurisu Makise.vrm')));
+    assert.deepEqual(readdirSync(modelsDir).filter((f) => f.endsWith('.parcial')), []);
+    const lista = await get(port, '/api/models');
+    assert.deepEqual(lista.json.map((m) => m.name), ['Kurisu Makise.vrm']);
+    const v = await abrirVisor(port);
+    assert.equal(v.hello.defaultModel, 'Kurisu Makise.vrm');
+    v.cerrar();
+  } finally { await app.close(); rmSync(modelsDir, { recursive: true, force: true }); }
+});
+
+test('POST /api/models rechaza nombre, contenido, tipo y origen inválidos', async () => {
+  const { app, port, modelsDir } = await arrancarConModelos();
+  try {
+    assert.equal((await postBinario(port, '/api/models', glbFalso(), { 'X-Filename': '..%2F..%2Fmalo.vrm' })).json.name, 'malo.vrm');
+    assert.equal((await postBinario(port, '/api/models', glbFalso(), { 'X-Filename': 'modelo.exe' })).status, 400);
+    assert.equal((await postBinario(port, '/api/models', glbFalso(), {})).status, 400);
+    assert.equal((await postBinario(port, '/api/models', Buffer.from('no es un glb, solo texto plano'), { 'X-Filename': 'x.vrm' })).status, 400);
+    const malLargo = glbFalso(); malLargo.writeUInt32LE(9999, 8);
+    assert.equal((await postBinario(port, '/api/models', malLargo, { 'X-Filename': 'x.vrm' })).status, 400);
+    assert.equal((await postBinario(port, '/api/models', glbFalso(), { 'X-Filename': 'x.vrm', 'Content-Type': 'text/plain' })).status, 403);
+    assert.equal((await postBinario(port, '/api/models', glbFalso(), { 'X-Filename': 'x.vrm', Origin: 'https://evil.example' })).status, 403);
+    // nada escapó de la carpeta de modelos
+    assert.deepEqual(readdirSync(modelsDir).sort(), ['malo.vrm']);
+  } finally { await app.close(); rmSync(modelsDir, { recursive: true, force: true }); }
+});
+
+test('el "hello" trae la huella del código del visor (los visores se recargan si cambia)', async () => {
+  const { app, port } = await arrancar();
+  try {
+    const v = await abrirVisor(port);
+    assert.match(v.hello.build, /^[0-9a-f]{16}$/);
+    const v2 = await abrirVisor(port);
+    assert.equal(v2.hello.build, v.hello.build);
+    v.cerrar(); v2.cerrar();
+  } finally { await app.close(); }
+});
